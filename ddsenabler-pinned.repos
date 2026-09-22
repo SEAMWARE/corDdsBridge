@@ -1,72 +1,56 @@
 # The DDS stack this bridge is built against.
 #
-# ⭐ OUR OWN FILE, not eProsima's. Theirs - ddsenabler.repos in the Enabler
-# repository - pins BRANCHES: master for Fast-CDR and Fast-DDS, main for
-# dev-utils, DDS-Pipe and the Enabler itself. Building from it means building
-# whatever those branches held at that moment, so two builds a week apart are
-# two different pieces of software, a green nightly says nothing about
-# tomorrow's, and a commit of eProsima's can redden our image with no change of
-# ours - looking exactly like our bug.
+# ⭐ THIS IS eProsima's OWN v1.2.2 COMBINATION, copied verbatim from that tag's
+# ddsenabler.repos. Not a set assembled here: a release pins its dependencies
+# to releases, and taking the whole of one is taking a combination its author
+# has built and tested together.
 #
-# These versions are the ones this bridge has actually been built and tested
-# against: they are what is installed on the development machine, and they
-# match the pins orion-ld carries, which is a second deployment's worth of
-# evidence that the combination works.
+# ⛔ NOT the repos file on `main`, which pins BRANCHES - master for Fast-CDR and
+# Fast-DDS, main for the rest. Importing that means building whatever those
+# branches held at that moment: two nightlies a week apart are two different
+# pieces of software, and a commit of eProsima's can redden this image with no
+# change of ours, looking exactly like our bug.
 #
-# ⚠ THE ENABLER IS PINNED TO A COMMIT, and it has to be. Three facts, each
-# checked rather than assumed:
+# ⛔ And not a raw commit, which is where this started. The bridge was developed
+# against append_action_infix @ c44b086 - a branch eProsima asked people to use
+# and has since DELETED, absent from git ls-remote, so a clean clone cannot
+# fetch it. That work reached main as ad19575 ("Append action infix to action
+# topics", #29), and v1.2.1 and v1.2.2 both contain it - checked with
+# `git tag --contains ad19575d8b6691c9d46c53733ac040e6afeca998`. So the commit
+# pin is no longer needed, and a supported release says the same thing.
 #
-#   The bridge was developed against append_action_infix @ c44b086 - a branch
-#   eProsima ASKED people to use and has since DELETED. It is absent from
-#   `git ls-remote`, so a clean clone cannot fetch it, and pinning what was
-#   tested would pin something unobtainable.
+# ⚠ THIS IS A JUMP FROM WHAT WAS TESTED BY HAND. The development machine carries
+# Fast DDS 3.3.0, Fast CDR 2.3.0, ddspipe and dev-utils 1.3.0; v1.2.2 asks for
+# 3.6.2, 2.3.6 and 1.5.3. The callback signatures this bridge implements are
+# eProsima's, so they can move between those. The nightly image build is what
+# finds out - and finding out on a schedule, rather than at a demo, is the
+# reason it exists.
 #
-#   That work is on main as ad19575, "Append action infix to action topics"
-#   (#29), which IS an ancestor of origin/main. `git diff c44b086 ad19575` over
-#   ddsenabler, ddsenabler_participants and ddsenabler_yaml is EMPTY: it is the
-#   same code, reachable.
-#
-#   And no release contains it. v1.2.0 differs by one line in
-#   ddsenabler_participants Constants.hpp - the ACTION_INFIX that builds action
-#   topic names. A tag would not fail to build; it would quietly produce
-#   different topic names, which is worse.
-#
-# So ad19575 is at once what was tested, what orion-ld ships, and what a clean
-# clone can get. Those three agreeing is the only reason to be comfortable here.
-# Verified by cloning the repository fresh and checking the commit out.
-#
-# ▶ IT CAN STOP BEING A RAW COMMIT when eProsima cuts a release containing it:
-#
-#     git tag --contains ad19575d8b6691c9d46c53733ac040e6afeca998
-#
-# Anything that prints is a tag to move to. Nothing printing means there is
-# still no release with the action infix in it, and this stays as it is.
-#
-# To move the stack: change a version here, run the nightly, and read what it
-# says. That is the whole procedure, and it is the reason this file exists.
+# To move the stack: replace this file with a newer release's ddsenabler.repos,
+# run the nightly, read what it says.
 
 repositories:
     foonathan_memory_vendor:
         type: git
         url: https://github.com/eProsima/foonathan_memory_vendor.git
-        version: v1.3.1
+        version: v1.4.1
     fastcdr:
         type: git
         url: https://github.com/eProsima/Fast-CDR.git
-        version: v2.3.0
+        version: v2.3.6
     fastdds:
         type: git
         url: https://github.com/eProsima/Fast-DDS.git
-        version: v3.3.0
+        version: v3.6.2
     dev-utils:
         type: git
         url: https://github.com/eProsima/dev-utils.git
-        version: v1.3.0
+        version: v1.5.3
     ddspipe:
         type: git
         url: https://github.com/eProsima/DDS-Pipe.git
-        version: v1.3.0
+        version: v1.5.3
     ddsenabler:
         type: git
         url: https://github.com/eProsima/FIWARE-DDS-Enabler.git
-        version: ad19575d8b6691c9d46c53733ac040e6afeca998
+        version: v1.2.2
