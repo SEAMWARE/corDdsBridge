@@ -11,6 +11,7 @@
 #include <cstring>                                     // strcmp, memcpy
 #include <map>                                         // std::map
 #include <mutex>                                       // std::mutex
+#include <set>                                         // std::set
 #include <string>                                      // std::string
 #include <vector>                                      // std::vector
 
@@ -59,6 +60,25 @@ std::shared_ptr<eprosima::ddsenabler::DDSEnabler>  enabler;
 //
 std::map<std::string, BridgeDirection>  carried;
 std::mutex                              carriedMutex;
+
+//
+// unwanted - the topics the BROKER has already refused
+//
+// A topic nobody configured used to be dropped here, which was right while the
+// broker's only answer to an unclaimed endpoint was BRIDGE_NOT_FOUND. It can
+// have another one now - a catch-all entity, where every endpoint on the
+// system shows up as an attribute - and that is a decision this plugin has no
+// business making: it does not read the ngsild section of the file and must
+// not start.
+//
+// So an unknown topic is handed over ONCE. If the broker says NOT_FOUND it
+// goes in here and is never offered again, and a domain with a thousand
+// unmapped topics costs a thousand calls in total rather than per second.
+//
+// ⚠ Emptied for an endpoint the moment a Channel claims it - see channelAdd.
+// A stale refusal would outlive the configuration that caused it.
+//
+std::set<std::string>                   unwanted;
 
 char  versionBuffer[256];
 
@@ -354,15 +374,21 @@ void dataNotification(const char* topicName, const char* json, int64_t publishTi
     if ((topicName == nullptr) || (json == nullptr) || (broker == nullptr))
         return;
 
+    bool claimed = false;
+
     {
         std::lock_guard<std::mutex> guard(carriedMutex);
         auto it = carried.find(topicName);
 
-        if (it == carried.end())
-            return;                                    // nobody asked for this topic
+        if (it != carried.end())
+        {
+            if (it->second == BridgeDirectionOut)
+                return;                                // outbound only
 
-        if (it->second == BridgeDirectionOut)
-            return;                                    // outbound only
+            claimed = true;
+        }
+        else if (unwanted.find(topicName) != unwanted.end())
+            return;                                    // offered once already, and refused
     }
 
     //
@@ -370,11 +396,20 @@ void dataNotification(const char* topicName, const char* json, int64_t publishTi
     // envelope around it.
     //
     std::string payload;
+    int         r;
 
     if (sampleUnwrap(topicName, json, payload) == true)
-        broker->sampleIn(bridgeAlias, topicName, payload.c_str(), publishTime);
+        r = broker->sampleIn(bridgeAlias, topicName, payload.c_str(), publishTime);
     else
-        broker->sampleIn(bridgeAlias, topicName, json, publishTime);
+        r = broker->sampleIn(bridgeAlias, topicName, json, publishTime);
+
+    if ((claimed == false) && (r == BRIDGE_NOT_FOUND))
+    {
+        std::lock_guard<std::mutex> guard(carriedMutex);
+        unwanted.insert(topicName);
+
+        KT_T(0, "dds: the broker has no use for topic '%s' - not offering it again", topicName);
+    }
 }
 
 
@@ -512,6 +547,7 @@ void close()
     {
         std::lock_guard<std::mutex> guard(carriedMutex);
         carried.clear();
+        unwanted.clear();
     }
 
     enabler.reset();
@@ -534,6 +570,7 @@ int channelAdd(const char* endpoint, BridgeChannelKind kind, BridgeDirection dir
 
     std::lock_guard<std::mutex> guard(carriedMutex);
     carried[endpoint] = direction;
+    unwanted.erase(endpoint);
 
     KT_T(0, "dds: carrying topic '%s'", endpoint);
 
