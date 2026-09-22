@@ -45,8 +45,17 @@ DDS_LIB        = /usr/local/lib/libddsenabler.so
 #
 DDS_JSON_HEADER = /usr/include/nlohmann/json.hpp
 
+#
+# And the same story again: ddspipe_yaml/Yaml.hpp includes <yaml-cpp/yaml.h>.
+# Found by a docker build that had nlohmann and not this one, and failed with
+# a fatal error naming ddspipe_yaml.
+#
+# Debian/Ubuntu: libyaml-cpp-dev
+#
+DDS_YAML_HEADER = /usr/include/yaml-cpp/yaml.h
+
 ifeq ($(COR_BRIDGE_DDS),auto)
-  ifeq ($(and $(wildcard $(DDS_HEADER)),$(wildcard $(DDS_LIB)),$(wildcard $(DDS_JSON_HEADER))),)
+  ifeq ($(and $(wildcard $(DDS_HEADER)),$(wildcard $(DDS_LIB)),$(wildcard $(DDS_JSON_HEADER)),$(wildcard $(DDS_YAML_HEADER))),)
     COR_BRIDGE_DDS := OFF
     DDS_SKIP_REASON := the DDS Enabler is not installed
   else
@@ -100,6 +109,7 @@ ddsCheck:
 	@test -f $(DDS_HEADER) || { echo "corDdsBridge: $(DDS_HEADER) not found - the DDS Enabler must be installed"; exit 1; }
 	@test -f $(DDS_LIB)    || { echo "corDdsBridge: $(DDS_LIB) not found - the DDS Enabler must be installed"; exit 1; }
 	@test -f $(DDS_JSON_HEADER) || { echo "corDdsBridge: $(DDS_JSON_HEADER) not found - the Enabler's own headers include <nlohmann/json.hpp> (apt: nlohmann-json3-dev)"; exit 1; }
+	@test -f $(DDS_YAML_HEADER) || { echo "corDdsBridge: $(DDS_YAML_HEADER) not found - the Enabler's own headers include <yaml-cpp/yaml.h> (apt: libyaml-cpp-dev)"; exit 1; }
 
 $(PLUGIN): $(OBJS)
 	$(CXX) -shared $(OBJS) -o $(PLUGIN) $(LDFLAGS) $(LIBS) -Wl,-rpath,/usr/local/lib
