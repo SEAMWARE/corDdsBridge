@@ -25,6 +25,8 @@ extern "C"
 #include "kjson/kjBufferCreate.h"                      // kjBufferCreate
 #include "kjson/kjParse.h"                             // kjParse
 #include "kjson/kjLookup.h"                            // kjLookup
+#include "kjson/kjRender.h"                            // kjFastRender
+#include "kjson/kjRenderSize.h"                        // kjFastRenderSize
 #include "kalloc/KAlloc.h"                             // KAlloc
 #include "kalloc/kaBufferInit.h"                       // kaBufferInit
 #include "kalloc/kaBufferReset.h"                      // kaBufferReset
@@ -275,6 +277,73 @@ bool topicQuery(const char* topicName, eprosima::ddsenabler::participants::Topic
 
 // -----------------------------------------------------------------------------
 //
+// sampleUnwrap - the message inside the Enabler's envelope
+//
+// The Enabler does not hand over the sample. It hands over an envelope with the
+// sample inside it:
+//
+//   { "id": "01.0f.70.b7.01.00.d0.1d.00.00.00.00",
+//     "rt/chatter": { "type": "std_msgs::msg::dds_::String_",
+//                     "data": { "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0":
+//                               { "data": "Hello World: 9" } } },
+//     "type": "fastdds" }
+//
+// and the broker's side of the seam is "the sample IS the value". Hand it that
+// and the attribute's value becomes a writer's GUID and a map keyed by an
+// instance handle, with the message three levels down - which is exactly what
+// the first REAL publisher, a ROS 2 talker, put in the entity.
+//
+// So the envelope comes off here, where the knowledge of it belongs: the topic
+// key, "data" under it, and the one instance under that. The broker keeps
+// knowing nothing about DDS, and a sample in is the mirror of a sample out.
+//
+// Returns false when the json is not an envelope of that shape - an Enabler
+// that changes it, or another producer - and the caller then passes the json on
+// untouched rather than dropping a sample it could have delivered.
+//
+static bool sampleUnwrap(const char* topicName, const char* json, std::string& payload)
+{
+    //
+    // kjParse works IN the buffer it is given, so the Enabler's string is
+    // copied first - it belongs to the Enabler and is const.
+    //
+    std::string  copy(json);
+    char         kallocBuffer[8192];
+    KAlloc       kalloc;
+    Kjson        kjson;
+    bool         unwrapped = false;
+
+    kaBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsSample");
+
+    Kjson*  kjP    = kjBufferCreate(&kjson, &kalloc);
+    KjNode* treeP  = kjParse(kjP, (char*) copy.c_str());
+    KjNode* topicP = ((treeP  != nullptr) && (treeP->type == KjObject))  ? kjLookup(treeP, topicName) : nullptr;
+    KjNode* dataP  = ((topicP != nullptr) && (topicP->type == KjObject)) ? kjLookup(topicP, "data")   : nullptr;
+    KjNode* sampleP = ((dataP != nullptr) && (dataP->type == KjObject))  ? dataP->value.firstChildP   : nullptr;
+
+    if (sampleP != nullptr)
+    {
+        //
+        // The instance handle is the member's NAME, and a rendered member is
+        // "name":value - so the name goes before the render, not after it.
+        //
+        sampleP->name = (char*) "";
+
+        payload.resize(kjFastRenderSize(sampleP));
+        kjFastRender(sampleP, (char*) payload.data());
+        payload.resize(strlen(payload.c_str()));
+        unwrapped = true;
+    }
+
+    kaBufferReset(&kalloc, KTRUE);
+
+    return unwrapped;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // dataNotification - a sample arrived
 //
 // ⚠ AN ENABLER THREAD, not one of the broker's. Everything that makes the call
@@ -296,7 +365,16 @@ void dataNotification(const char* topicName, const char* json, int64_t publishTi
             return;                                    // outbound only
     }
 
-    broker->sampleIn(bridgeAlias, topicName, json, publishTime);
+    //
+    // Only what the publisher wrote crosses the seam, not the Enabler's
+    // envelope around it.
+    //
+    std::string payload;
+
+    if (sampleUnwrap(topicName, json, payload) == true)
+        broker->sampleIn(bridgeAlias, topicName, payload.c_str(), publishTime);
+    else
+        broker->sampleIn(bridgeAlias, topicName, json, publishTime);
 }
 
 
