@@ -1,0 +1,49 @@
+# The DDS stack this bridge is built against.
+#
+# ⭐ OUR OWN FILE, not eProsima's. Theirs - ddsenabler.repos in the Enabler
+# repository - pins BRANCHES: master for Fast-CDR and Fast-DDS, main for
+# dev-utils, DDS-Pipe and the Enabler itself. Building from it means building
+# whatever those branches held at that moment, so two builds a week apart are
+# two different pieces of software, a green nightly says nothing about
+# tomorrow's, and a commit of eProsima's can redden our image with no change of
+# ours - looking exactly like our bug.
+#
+# These versions are the ones this bridge has actually been built and tested
+# against: they are what is installed on the development machine, and they
+# match the pins orion-ld carries, which is a second deployment's worth of
+# evidence that the combination works.
+#
+# ⚠ The Enabler is pinned to a RELEASE here, which is fine for topics and will
+# not be for actions. orion-ld pins a commit instead - ad19575, "Append action
+# infix to action topics" - because the infix builds action topic names, and no
+# release contains it: v1.2.0 predates it. A tag would not fail to build, it
+# would quietly produce different topic names. Revisit when actions are carried.
+#
+# To move the stack: change a version here, run the nightly, and read what it
+# says. That is the whole procedure, and it is the reason this file exists.
+
+repositories:
+    foonathan_memory_vendor:
+        type: git
+        url: https://github.com/eProsima/foonathan_memory_vendor.git
+        version: v1.3.1
+    fastcdr:
+        type: git
+        url: https://github.com/eProsima/Fast-CDR.git
+        version: v2.3.0
+    fastdds:
+        type: git
+        url: https://github.com/eProsima/Fast-DDS.git
+        version: v3.3.0
+    dev-utils:
+        type: git
+        url: https://github.com/eProsima/dev-utils.git
+        version: v1.3.0
+    ddspipe:
+        type: git
+        url: https://github.com/eProsima/DDS-Pipe.git
+        version: v1.3.0
+    ddsenabler:
+        type: git
+        url: https://github.com/eProsima/FIWARE-DDS-Enabler.git
+        version: v1.2.0
