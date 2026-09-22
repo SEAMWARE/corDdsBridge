@@ -100,6 +100,27 @@ clean:
 
 endif
 
-.PHONY: all install di ci clean ddsCheck
+#
+# contract - does this plugin still satisfy BridgeDriver.h?
+#
+# ⭐ NEEDS NO DDS AT ALL, and that is the point. ddsRegister.cpp includes only
+# ddsBridge.hpp, which includes only corBridge's two headers - so the file that
+# fills in the BridgeDriver struct, and therefore the file that breaks the
+# moment the contract changes, compiles anywhere corBridge is checked out.
+#
+# That makes it cheap enough to run on every pull request, which is what stops
+# this repo rotting. Without it a change to BridgeDriver.h would build clean in
+# coraine, skip silently here (no Enabler on a CI runner, so auto turns the
+# build OFF) and be discovered by hand, later, by whoever next needed DDS.
+#
+# The full build still requires the Enabler. This checks the seam, not the
+# transport.
+#
+contract:
+	@$(CXX) -std=c++17 -Wall -Werror -fPIC -I$(COR_LIBS) -c ddsRegister.cpp -o /tmp/corDdsBridge-contract.o
+	@rm -f /tmp/corDdsBridge-contract.o
+	@echo "corDdsBridge: contract OK - BridgeDriver.h is still satisfied"
+
+.PHONY: all install di ci clean ddsCheck contract
 
 -include $(DEPS)
