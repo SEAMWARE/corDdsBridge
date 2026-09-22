@@ -13,11 +13,34 @@
 # match the pins orion-ld carries, which is a second deployment's worth of
 # evidence that the combination works.
 #
-# ⚠ The Enabler is pinned to a RELEASE here, which is fine for topics and will
-# not be for actions. orion-ld pins a commit instead - ad19575, "Append action
-# infix to action topics" - because the infix builds action topic names, and no
-# release contains it: v1.2.0 predates it. A tag would not fail to build, it
-# would quietly produce different topic names. Revisit when actions are carried.
+# ⚠ THE ENABLER IS PINNED TO A COMMIT, and it has to be. Three facts, each
+# checked rather than assumed:
+#
+#   The bridge was developed against append_action_infix @ c44b086 - a branch
+#   eProsima ASKED people to use and has since DELETED. It is absent from
+#   `git ls-remote`, so a clean clone cannot fetch it, and pinning what was
+#   tested would pin something unobtainable.
+#
+#   That work is on main as ad19575, "Append action infix to action topics"
+#   (#29), which IS an ancestor of origin/main. `git diff c44b086 ad19575` over
+#   ddsenabler, ddsenabler_participants and ddsenabler_yaml is EMPTY: it is the
+#   same code, reachable.
+#
+#   And no release contains it. v1.2.0 differs by one line in
+#   ddsenabler_participants Constants.hpp - the ACTION_INFIX that builds action
+#   topic names. A tag would not fail to build; it would quietly produce
+#   different topic names, which is worse.
+#
+# So ad19575 is at once what was tested, what orion-ld ships, and what a clean
+# clone can get. Those three agreeing is the only reason to be comfortable here.
+# Verified by cloning the repository fresh and checking the commit out.
+#
+# ▶ IT CAN STOP BEING A RAW COMMIT when eProsima cuts a release containing it:
+#
+#     git tag --contains ad19575d8b6691c9d46c53733ac040e6afeca998
+#
+# Anything that prints is a tag to move to. Nothing printing means there is
+# still no release with the action infix in it, and this stays as it is.
 #
 # To move the stack: change a version here, run the nightly, and read what it
 # says. That is the whole procedure, and it is the reason this file exists.
@@ -46,4 +69,4 @@ repositories:
     ddsenabler:
         type: git
         url: https://github.com/eProsima/FIWARE-DDS-Enabler.git
-        version: v1.2.0
+        version: ad19575d8b6691c9d46c53733ac040e6afeca998
