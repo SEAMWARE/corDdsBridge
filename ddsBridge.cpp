@@ -21,7 +21,6 @@
 extern "C"
 {
 #include "ktrace/kTrace.h"                             // KT_I, KT_W, KT_E, KT_T
-#include "kbase/kFileRead.h"                           // kFileRead
 #include "kjson/kjson.h"                               // Kjson
 #include "kjson/kjBufferCreate.h"                      // kjBufferCreate
 #include "kjson/kjParse.h"                             // kjParse
@@ -352,11 +351,24 @@ int init(const char* configFile, const BridgeBroker* brokerP)
     // no JSON library to link here and no second parser to keep in step.
     //
     {
-        char*  buf    = nullptr;
-        int    bufLen = 0;
+        //
+        // fopen and not kFileRead: given an empty base, kFileRead does not
+        // resolve a plain relative path, and the failure here is SILENT - the
+        // typesDirectory would simply never be picked up for anyone who passed
+        // --bridgeConfig a relative path.
+        //
+        FILE* fP = fopen(configFile, "r");
 
-        if (kFileRead((char*) "", (char*) configFile, &buf, &bufLen) == 0)
+        if (fP != nullptr)
         {
+            fseek(fP, 0, SEEK_END);
+            long size = ftell(fP);
+            fseek(fP, 0, SEEK_SET);
+
+            std::vector<char> buf((size > 0) ? size + 1 : 1, 0);
+
+            if ((size > 0) && (fread(buf.data(), 1, (size_t) size, fP) == (size_t) size))
+            {
             char    kallocBuffer[8192];
             KAlloc  kalloc;
             Kjson   kjson;
@@ -364,7 +376,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
             kaBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsTypes");
 
             Kjson*  kjP   = kjBufferCreate(&kjson, &kalloc);
-            KjNode* treeP = kjParse(kjP, buf);
+            KjNode* treeP = kjParse(kjP, buf.data());
             KjNode* ddsP  = (treeP  != nullptr) ? kjLookup(treeP, "dds")     : nullptr;
             KjNode* ngP   = (ddsP   != nullptr) ? kjLookup(ddsP, "ngsild")   : nullptr;
             KjNode* dirP  = (ngP    != nullptr) ? kjLookup(ngP, "typesDirectory") : nullptr;
@@ -376,6 +388,8 @@ int init(const char* configFile, const BridgeBroker* brokerP)
             }
 
             kaBufferReset(&kalloc, KTRUE);
+            }
+            fclose(fP);
         }
     }
 
