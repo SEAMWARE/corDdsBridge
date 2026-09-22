@@ -34,8 +34,19 @@ COR_BRIDGE_DDS ?= auto
 DDS_HEADER     = /usr/local/include/ddsenabler/DDSEnabler.hpp
 DDS_LIB        = /usr/local/lib/libddsenabler.so
 
+#
+# nlohmann/json is a TRANSITIVE build dependency, not ours: the Enabler's own
+# public header ddsenabler_participants/Writer.hpp includes <nlohmann/json.hpp>,
+# so anything compiling against the Enabler needs it present. Nothing here uses
+# it directly, which is exactly why its absence is confusing - the error names a
+# file in /usr/local/include that we did not write.
+#
+# Debian/Ubuntu: nlohmann-json3-dev
+#
+DDS_JSON_HEADER = /usr/include/nlohmann/json.hpp
+
 ifeq ($(COR_BRIDGE_DDS),auto)
-  ifeq ($(and $(wildcard $(DDS_HEADER)),$(wildcard $(DDS_LIB))),)
+  ifeq ($(and $(wildcard $(DDS_HEADER)),$(wildcard $(DDS_LIB)),$(wildcard $(DDS_JSON_HEADER))),)
     COR_BRIDGE_DDS := OFF
     DDS_SKIP_REASON := the DDS Enabler is not installed
   else
@@ -88,6 +99,7 @@ all: ddsCheck $(PLUGIN)
 ddsCheck:
 	@test -f $(DDS_HEADER) || { echo "corDdsBridge: $(DDS_HEADER) not found - the DDS Enabler must be installed"; exit 1; }
 	@test -f $(DDS_LIB)    || { echo "corDdsBridge: $(DDS_LIB) not found - the DDS Enabler must be installed"; exit 1; }
+	@test -f $(DDS_JSON_HEADER) || { echo "corDdsBridge: $(DDS_JSON_HEADER) not found - the Enabler's own headers include <nlohmann/json.hpp> (apt: nlohmann-json3-dev)"; exit 1; }
 
 $(PLUGIN): $(OBJS)
 	$(CXX) -shared $(OBJS) -o $(PLUGIN) $(LDFLAGS) $(LIBS) -Wl,-rpath,/usr/local/lib

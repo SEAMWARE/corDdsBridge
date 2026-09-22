@@ -59,9 +59,26 @@ coraine --bridges dds --bridgeConfig /path/to/that.json
 ## Build
 
 ```sh
-make            # needs the DDS Enabler and Fast DDS in /usr/local
+make            # build
 make install    # drops dds.so into /opt/seamware/plugins/bridge/
+make contract   # does this still satisfy BridgeDriver.h? needs no DDS at all
 ```
+
+Needs the DDS Enabler and Fast DDS in `/usr/local`, and **`nlohmann-json3-dev`**
+— that last one is transitive and surprising: the Enabler's own public header
+`ddsenabler_participants/Writer.hpp` includes `<nlohmann/json.hpp>`, so anything
+compiling against the Enabler needs it. Nothing here uses it directly, which is
+why its absence reads as an error in a file nobody here wrote. `make` checks for
+it by name.
+
+Whether it builds at all is a configuration decision, not a matter of which
+list this repo appears in:
+
+| `COR_BRIDGE_DDS` | |
+|---|---|
+| `auto` (default) | build where the Enabler is installed, skip where it is not — and say which |
+| `ON` | build; a missing dependency is an error |
+| `OFF` | do not build |
 
 Nothing of the broker's is linked: `ktrace` and the rest resolve from the
 running process, which is linked `rdynamic`.
