@@ -45,7 +45,14 @@ endif
 
 PLUGIN        = dds.so
 CXX           = g++
-COR_LIBS     ?= $(HOME)/git
+#
+# The directory the sibling repos live in, which is simply the parent: this repo
+# sits beside corBridge on a workstation (~/git/...) and beside it on a CI
+# runner (<workspace>/stack/...) alike. It was $(HOME)/git, which is true of
+# exactly one of those and failed on the other with "corBridge/BridgeDriver.h:
+# No such file or directory".
+#
+COR_LIBS     ?= ..
 PLUGIN_DIR   ?= /opt/seamware/plugins/bridge
 
 INCLUDE       = -I$(COR_LIBS) -I/usr/local/include
