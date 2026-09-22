@@ -7,11 +7,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include <cstdio>                                      // snprintf
-#include <cstring>                                     // strcmp
+#include <cstdio>                                      // snprintf, fopen, fread, fwrite
+#include <cstring>                                     // strcmp, memcpy
 #include <map>                                         // std::map
 #include <mutex>                                       // std::mutex
 #include <string>                                      // std::string
+#include <vector>                                      // std::vector
 
 #include <ddsenabler/dds_enabler_runner.hpp>           // create_dds_enabler
 #include <ddsenabler/DDSEnabler.hpp>                   // DDSEnabler
@@ -20,6 +21,14 @@
 extern "C"
 {
 #include "ktrace/kTrace.h"                             // KT_I, KT_W, KT_E, KT_T
+#include "kbase/kFileRead.h"                           // kFileRead
+#include "kjson/kjson.h"                               // Kjson
+#include "kjson/kjBufferCreate.h"                      // kjBufferCreate
+#include "kjson/kjParse.h"                             // kjParse
+#include "kjson/kjLookup.h"                            // kjLookup
+#include "kalloc/KAlloc.h"                             // KAlloc
+#include "kalloc/kaBufferInit.h"                       // kaBufferInit
+#include "kalloc/kaBufferReset.h"                      // kaBufferReset
 }
 
 #include "ddsBridge.hpp"                               // Own interface
@@ -51,6 +60,218 @@ std::map<std::string, BridgeDirection>  carried;
 std::mutex                              carriedMutex;
 
 char  versionBuffer[256];
+
+
+//
+// What the DDS system has told us about itself.
+//
+// ⭐ THE BROKER CAN ONLY WORK ON WHAT IS ALREADY KNOWN IN THE DDS SYSTEM. It is
+// a participant in that system, not the author of it: types and topics are
+// defined by the applications on the domain, discovered as they announce
+// themselves, and the broker's job is to remember what it was told and hand it
+// back when the Enabler asks.
+//
+// So there is no way to declare a type here and none is wanted. A topic nobody
+// has announced is a topic the broker cannot publish to, and saying so is the
+// correct answer.
+//
+std::map<std::string, std::vector<unsigned char>>  typeStore;
+std::map<std::string, eprosima::ddsenabler::participants::TopicInfo>  topicStore;
+std::mutex                                         discoveryMutex;
+
+//
+// Where a discovered type is kept between runs. From dds.ngsild.typesDirectory;
+// empty means types live only as long as the process, which is correct but
+// means a restart is blind until every publisher has announced itself again.
+//
+std::string  typesDirectory;
+
+
+// -----------------------------------------------------------------------------
+//
+// typePath - where a type's bytes live on disk
+//
+// A type name is an IDL identifier with '::' separators; '/' never occurs in
+// one, so the name is a filename as it stands.
+//
+std::string typePath(const char* typeName)
+{
+    return typesDirectory + "/" + typeName + ".bin";
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// typeNotification - the DDS system announced a type
+//
+// Kept in memory, and written to typesDirectory if there is one. The bytes are
+// the Enabler's INTERNAL representation, not the IDL text: it is what
+// type_query has to hand back, so it is what gets stored.
+//
+void typeNotification(const char*          typeName,
+                      const char*          serializedType,
+                      const unsigned char* serializedTypeInternal,
+                      uint32_t             serializedTypeInternalSize,
+                      const char*          dataPlaceholder)
+{
+    (void) serializedType;                             // the IDL text, of interest to a human and not to us
+    (void) dataPlaceholder;
+
+    if ((typeName == nullptr) || (serializedTypeInternal == nullptr) || (serializedTypeInternalSize == 0))
+        return;
+
+    {
+        std::lock_guard<std::mutex> guard(discoveryMutex);
+        typeStore[typeName] = std::vector<unsigned char>(serializedTypeInternal,
+                                                         serializedTypeInternal + serializedTypeInternalSize);
+    }
+
+    KT_T(0, "dds: learned type '%s' (%u bytes)", typeName, serializedTypeInternalSize);
+
+    if (typesDirectory.empty() == true)
+        return;
+
+    //
+    // Written so a restart is not blind until every publisher happens to
+    // announce itself again.
+    //
+    FILE* fP = fopen(typePath(typeName).c_str(), "wb");
+
+    if (fP == nullptr)
+    {
+        KT_W("dds: cannot write type '%s' to '%s'", typeName, typesDirectory.c_str());
+        return;
+    }
+
+    fwrite(serializedTypeInternal, 1, serializedTypeInternalSize, fP);
+    fclose(fP);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// typeQuery - the Enabler needs a type's bytes
+//
+// From memory, else from typesDirectory. Ownership of the buffer passes to the
+// Enabler through the unique_ptr, which is one of the several things in this
+// API that cannot be expressed in C.
+//
+bool typeQuery(const char*                              typeName,
+               std::unique_ptr<const unsigned char[]>&  serializedTypeInternal,
+               uint32_t&                                serializedTypeInternalSize)
+{
+    if (typeName == nullptr)
+        return false;
+
+    {
+        std::lock_guard<std::mutex> guard(discoveryMutex);
+        auto it = typeStore.find(typeName);
+
+        if (it != typeStore.end())
+        {
+            unsigned char* copy = new unsigned char[it->second.size()];
+
+            memcpy(copy, it->second.data(), it->second.size());
+            serializedTypeInternal.reset(copy);
+            serializedTypeInternalSize = (uint32_t) it->second.size();
+
+            return true;
+        }
+    }
+
+    if (typesDirectory.empty() == true)
+        return false;
+
+    FILE* fP = fopen(typePath(typeName).c_str(), "rb");
+
+    if (fP == nullptr)
+        return false;
+
+    fseek(fP, 0, SEEK_END);
+    long size = ftell(fP);
+    fseek(fP, 0, SEEK_SET);
+
+    if (size <= 0)
+    {
+        fclose(fP);
+        return false;
+    }
+
+    unsigned char* data = new unsigned char[size];
+
+    if (fread(data, 1, (size_t) size, fP) != (size_t) size)
+    {
+        fclose(fP);
+        delete[] data;
+        return false;
+    }
+    fclose(fP);
+
+    {
+        std::lock_guard<std::mutex> guard(discoveryMutex);
+        typeStore[typeName] = std::vector<unsigned char>(data, data + size);
+    }
+
+    serializedTypeInternal.reset(data);
+    serializedTypeInternalSize = (uint32_t) size;
+
+    KT_T(0, "dds: loaded type '%s' from disk (%ld bytes)", typeName, size);
+
+    return true;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// topicNotification - the DDS system announced a topic
+//
+void topicNotification(const char* topicName, const eprosima::ddsenabler::participants::TopicInfo& topicInfo)
+{
+    if (topicName == nullptr)
+        return;
+
+    {
+        std::lock_guard<std::mutex> guard(discoveryMutex);
+        topicStore[topicName] = topicInfo;
+    }
+
+    KT_T(0, "dds: learned topic '%s' of type '%s'", topicName, topicInfo.type_name.c_str());
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// topicQuery - the Enabler needs a topic's type and QoS
+//
+// ⭐ FALSE when the topic is unknown, and that is the whole point of
+// implementing this. Answering true with an unfilled TopicInfo hands the
+// Enabler an empty type name, and the failure then happens further in and looks
+// like something else. A topic nobody has announced is a topic this broker
+// cannot serialize for, and the honest answer is the useful one.
+//
+bool topicQuery(const char* topicName, eprosima::ddsenabler::participants::TopicInfo& topicInfo)
+{
+    if (topicName == nullptr)
+        return false;
+
+    std::lock_guard<std::mutex> guard(discoveryMutex);
+    auto it = topicStore.find(topicName);
+
+    if (it == topicStore.end())
+    {
+        KT_T(0, "dds: topic '%s' has not been announced on this domain", topicName);
+        return false;
+    }
+
+    topicInfo = it->second;
+
+    return true;
+}
+
 
 
 // -----------------------------------------------------------------------------
@@ -125,15 +346,52 @@ int init(const char* configFile, const BridgeBroker* brokerP)
         return BRIDGE_ERR;
     }
 
+    //
+    // dds.ngsild.typesDirectory, if the file names one. Read with the host's
+    // own kjson - a plugin resolves the broker's symbols at dlopen, so there is
+    // no JSON library to link here and no second parser to keep in step.
+    //
+    {
+        char*  buf    = nullptr;
+        int    bufLen = 0;
+
+        if (kFileRead((char*) "", (char*) configFile, &buf, &bufLen) == 0)
+        {
+            char    kallocBuffer[8192];
+            KAlloc  kalloc;
+            Kjson   kjson;
+
+            kaBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsTypes");
+
+            Kjson*  kjP   = kjBufferCreate(&kjson, &kalloc);
+            KjNode* treeP = kjParse(kjP, buf);
+            KjNode* ddsP  = (treeP  != nullptr) ? kjLookup(treeP, "dds")     : nullptr;
+            KjNode* ngP   = (ddsP   != nullptr) ? kjLookup(ddsP, "ngsild")   : nullptr;
+            KjNode* dirP  = (ngP    != nullptr) ? kjLookup(ngP, "typesDirectory") : nullptr;
+
+            if ((dirP != nullptr) && (dirP->type == KjString) && (dirP->value.s != nullptr))
+            {
+                typesDirectory = dirP->value.s;
+                KT_I("dds: types are kept in '%s'", typesDirectory.c_str());
+            }
+
+            kaBufferReset(&kalloc, KTRUE);
+        }
+    }
+
     eprosima::ddsenabler::CallbackSet callbacks{};
 
-    callbacks.log                   = logConsumer;
-    callbacks.dds.data_notification = dataNotification;
+    callbacks.log                    = logConsumer;
+    callbacks.dds.data_notification  = dataNotification;
+    callbacks.dds.type_notification  = typeNotification;
+    callbacks.dds.topic_notification = topicNotification;
+    callbacks.dds.type_query         = typeQuery;
+    callbacks.dds.topic_query        = topicQuery;
 
     //
-    // The remaining callbacks stay null on purpose. Type and topic discovery,
-    // services and actions are not carried yet, and a null entry is how the
-    // Enabler is told so - the same convention the BridgeDriver uses.
+    // The service and action callbacks stay null on purpose - not carried yet,
+    // and a null entry is how the Enabler is told so, the same convention the
+    // BridgeDriver uses.
     //
     if (eprosima::ddsenabler::create_dds_enabler(configFile, callbacks, enabler) == false)
     {
