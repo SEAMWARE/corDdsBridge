@@ -57,6 +57,7 @@ int   channelAdd(const char* endpoint, BridgeChannelKind kind, BridgeDirection d
 int   channelDel(const char* endpoint);
 int   publish(const char* endpoint, const char* json);
 int   serviceInvoke(const char* endpoint, const char* json);
+int   serviceInvokeTracked(const char* endpoint, const char* json, uint64_t token);
 const BridgeServer* serverIface();
 const char* versionInfo();
 

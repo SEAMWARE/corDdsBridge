@@ -55,5 +55,11 @@ extern "C" void bridgeRegister(BridgeDriver* driverP)
     // And now the field is the PLUGIN's, which is what the host reads back: it
     // logs a mismatch against its own and reports it in GET /version.
     //
+    //
+    // ABI 3, and only where the host has the slot - see BridgeDriver.h.
+    //
+    if (hostAbi >= 3)
+        driverP->serviceInvokeTracked = coraine::dds::serviceInvokeTracked;
+
     driverP->abiVersion = BRIDGE_ABI_VERSION;
 }
