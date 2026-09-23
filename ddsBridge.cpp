@@ -10,7 +10,8 @@
 #include <cstdio>                                      // snprintf, fopen, fread, fwrite
 #include <cstring>                                     // strcmp, memcpy
 #include <map>                                         // std::map
-#include <mutex>                                       // std::mutex
+#include <mutex>                                       // std::mutex, std::recursive_mutex
+#include <chrono>                                      // std::chrono::steady_clock
 #include <set>                                         // std::set
 #include <string>                                      // std::string
 #include <vector>                                      // std::vector
@@ -441,6 +442,57 @@ void serviceNotification(const char* serviceName, const eprosima::ddsenabler::pa
 
 // -----------------------------------------------------------------------------
 //
+// Tracked requests - the broker's token, by the Enabler's request id
+//
+// A request somebody waits for (ddsSync, see serviceInvokeTracked) must have
+// its reply handed back with the token the broker gave it. The Enabler knows
+// the reply only by ITS request id, so this is the one place the two meet.
+//
+// ⭐ ONE LOCK ACROSS "SEND AND REMEMBER", and the reply callback takes it too.
+// The request id exists only once send_service_request has returned, and the
+// reply comes on an Enabler thread that is free to run before this one gets to
+// write the id down; taking the lock first makes the reply wait for the entry
+// instead of missing it and going the untracked way. Recursive, so that a
+// transport answering on the sending thread itself could not deadlock here.
+//
+// An entry whose reply never comes is forgotten after TRACKED_KEEP: the request
+// waiting for it gave up long before, and the broker drops a reply that late
+// anyway.
+//
+struct TrackedRequest
+{
+    uint64_t                               token;
+    std::chrono::steady_clock::time_point  sentAt;
+};
+
+static std::recursive_mutex                    trackedMutex;
+static std::map<uint64_t, TrackedRequest>      trackedRequests;
+static const std::chrono::minutes              TRACKED_KEEP(10);
+
+
+
+// -----------------------------------------------------------------------------
+//
+// trackedTake - the token a reply must carry back, 0 if it was not tracked
+//
+static uint64_t trackedTake(uint64_t requestId)
+{
+    std::lock_guard<std::recursive_mutex> guard(trackedMutex);
+    auto it = trackedRequests.find(requestId);
+
+    if (it == trackedRequests.end())
+        return 0;
+
+    uint64_t token = it->second.token;
+    trackedRequests.erase(it);
+
+    return token;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // serviceReplyNotification - an answer came back
 //
 // ⚠ AN ENABLER THREAD, as dataNotification.
@@ -448,6 +500,8 @@ void serviceNotification(const char* serviceName, const eprosima::ddsenabler::pa
 // The requestId is not passed on. It correlates a reply to a request, which is
 // this plugin's business and finishes here: the broker identifies the exchange
 // by its ENDPOINT, because an endpoint is what a Channel binds to an attribute.
+// Except for a request somebody WAITS for, whose reply goes back through
+// replyIn() with the broker's own token - see the tracked requests above.
 //
 void serviceReplyNotification(const char* serviceName, const char* json, uint64_t requestId, int64_t publishTime)
 {
@@ -474,11 +528,17 @@ void serviceReplyNotification(const char* serviceName, const char* json, uint64_
     // crosses the seam.
     //
     std::string payload;
+    const char* answer = (sampleUnwrap(nullptr, json, payload) == true) ? payload.c_str() : json;
+    uint64_t    token  = trackedTake(requestId);
 
-    if (sampleUnwrap(nullptr, json, payload) == true)
-        broker->sampleQualifiedIn(bridgeAlias, serviceName, nullptr, DDS_SERVICE_REPLY, payload.c_str(), publishTime);
+    //
+    // ABI 3 AND a non-NULL slot: a host that is not the broker (ftClient) is
+    // built against the same header and fills in only what it needs.
+    //
+    if ((token != 0) && (broker->abiVersion >= 3) && (broker->replyIn != nullptr))
+        broker->replyIn(bridgeAlias, serviceName, token, nullptr, DDS_SERVICE_REPLY, answer, publishTime);
     else
-        broker->sampleQualifiedIn(bridgeAlias, serviceName, nullptr, DDS_SERVICE_REPLY, json, publishTime);
+        broker->sampleQualifiedIn(bridgeAlias, serviceName, nullptr, DDS_SERVICE_REPLY, answer, publishTime);
 }
 
 
@@ -969,6 +1029,56 @@ int serviceInvoke(const char* endpoint, const char* json)
     }
 
     KT_T(0, "dds: request %llu sent to service '%s'", (unsigned long long) requestId, endpoint);
+
+    return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceInvokeTracked - ask a service something, for a request that waits
+//
+// serviceInvoke(), plus the broker's token remembered next to the Enabler's
+// request id, so that the reply can be handed back with it. See the tracked
+// requests above, and BridgeDriver.h.
+//
+int serviceInvokeTracked(const char* endpoint, const char* json, uint64_t token)
+{
+    if ((endpoint == nullptr) || (json == nullptr) || (token == 0))
+        return BRIDGE_BAD_INPUT;
+
+    if (enabler == nullptr)
+        return BRIDGE_ERR;
+
+    std::lock_guard<std::recursive_mutex> guard(trackedMutex);
+
+    //
+    // Forget what can no longer be answered to anybody.
+    //
+    auto now = std::chrono::steady_clock::now();
+
+    for (auto it = trackedRequests.begin(); it != trackedRequests.end(); )
+    {
+        if (now - it->second.sentAt > TRACKED_KEEP)
+            it = trackedRequests.erase(it);
+        else
+            ++it;
+    }
+
+    uint64_t requestId = 0;
+
+    if (enabler->send_service_request(endpoint, json, requestId) == false)
+    {
+        KT_W("dds: could not send a request to service '%s' - no server, or the payload does not fit '%s'",
+             endpoint, json);
+        return BRIDGE_ERR;
+    }
+
+    trackedRequests[requestId] = TrackedRequest{ token, now };
+
+    KT_T(0, "dds: request %llu sent to service '%s', waited for (token %llu)",
+         (unsigned long long) requestId, endpoint, (unsigned long long) token);
 
     return BRIDGE_OK;
 }
