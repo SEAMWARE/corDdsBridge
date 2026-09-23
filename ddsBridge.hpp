@@ -27,6 +27,7 @@ extern "C"
 {
 #include "corBridge/BridgeDriver.h"                    // BridgeDriver, BridgeChannelKind, BridgeDirection
 #include "corBridge/BridgeBroker.h"                    // BridgeBroker, BRIDGE_*
+#include "corBridge/BridgeServer.h"                    // BridgeServer
 }
 
 #include <cstdint>                                     // int64_t
@@ -55,6 +56,8 @@ void  close();
 int   channelAdd(const char* endpoint, BridgeChannelKind kind, BridgeDirection direction);
 int   channelDel(const char* endpoint);
 int   publish(const char* endpoint, const char* json);
+int   serviceInvoke(const char* endpoint, const char* json);
+const BridgeServer* serverIface();
 const char* versionInfo();
 
 }  // namespace dds

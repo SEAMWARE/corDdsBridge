@@ -58,8 +58,19 @@ std::shared_ptr<eprosima::ddsenabler::DDSEnabler>  enabler;
 // lock, per sample, for data nobody asked for. So the set is kept here and the
 // sample is dropped before it crosses the seam.
 //
-std::map<std::string, BridgeDirection>  carried;
-std::mutex                              carriedMutex;
+//
+// What a Channel told us about an endpoint. The direction decides whether an
+// arriving sample is wanted; the kind decides which of the transport's
+// mechanisms the endpoint is - a topic is published to, a service is asked.
+//
+struct Carried
+{
+    BridgeChannelKind  kind;
+    BridgeDirection    direction;
+};
+
+std::map<std::string, Carried>  carried;
+std::mutex                      carriedMutex;
 
 //
 // unwanted - the topics the BROKER has already refused
@@ -295,6 +306,221 @@ bool topicQuery(const char* topicName, eprosima::ddsenabler::participants::Topic
 
 
 
+//
+// Defined below, with the rest of the sample handling - a reply arrives inside
+// the same envelope a sample does, so it comes off in the same place.
+//
+static bool sampleUnwrap(const char* topicName, const char* json, std::string& payload);
+
+
+
+// -----------------------------------------------------------------------------
+//
+// DDS_SERVICE_REPLY - where a reply lands, and a name that is PROVISIONAL
+//
+// ⚠ The next release of NGSI-LD is expected to introduce a first-class Service
+// Execution concept, and it will decide how an invocation and its answer appear
+// in the model. Until it does, something has to be chosen, because a client
+// that invokes a service has to read the answer somewhere - and what is chosen
+// here is the shape already in field use, so that deployments and tooling that
+// read it keep working.
+//
+// ⭐ IT IS SPELLED HERE AND NOWHERE ELSE. The broker is handed a sub-attribute
+// name and stores it; it does not know this string, has no branch on it and
+// never will. When Service Execution lands, what changes is this line and the
+// translation around it - not the broker, and not the model.
+//
+#define DDS_SERVICE_REPLY  "ddsServiceReply"
+
+
+
+// -----------------------------------------------------------------------------
+//
+// ServiceTypes - the request and reply types of one service
+//
+// ⭐ A SERVICE CANNOT BE LEARNED BY LISTENING, and that is the operational
+// difference from a topic. A topic's type arrives with the first publisher;
+// there is nobody to learn a service's types from before the first client
+// speaks, and by then it is too late - the request has to be serialized to be
+// sent at all. So they are configured, and the types themselves come off disk
+// (see typeQuery).
+//
+// The file names them per service; the convention when it does not is the one
+// the tooling in this world already uses, name + _Request / _Response.
+//
+struct ServiceTypes
+{
+    std::string  request;
+    std::string  reply;
+};
+
+std::map<std::string, ServiceTypes>  serviceConfig;    // from the configuration file
+std::mutex                           serviceMutex;
+
+//
+// Which services this process ANSWERS, and who answers them.
+//
+// ⛔ Empty in the broker, always. The broker is a client and has nothing to
+// compute an answer with; this exists for a host that is not a broker - see
+// BridgeServer.h.
+//
+std::map<std::string, BridgeServiceRequestFunc>  served;
+
+
+// -----------------------------------------------------------------------------
+//
+// SERVICE_QOS - what is announced about a service's two topics
+//
+// The Enabler asks for QoS as text in its own serialized form. Reliable and
+// volatile, which is what a request/reply exchange wants: an answer that
+// arrives late is still an answer, an answer that is durable is an answer to a
+// question nobody is waiting for any more.
+//
+#define SERVICE_QOS  "reliability: true\ndurability: false\nownership: false\nkeyed: false"
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceQuery - the Enabler needs a service's request and reply types
+//
+// ⭐ FALSE when the service was never configured, for the same reason
+// topicQuery answers false for an unknown topic: an empty ServiceInfo would be
+// accepted here and fail somewhere further in, looking like something else.
+//
+bool serviceQuery(const char* serviceName, eprosima::ddsenabler::participants::ServiceInfo& serviceInfo)
+{
+    if (serviceName == nullptr)
+        return false;
+
+    std::lock_guard<std::mutex> guard(serviceMutex);
+    auto it = serviceConfig.find(serviceName);
+
+    if (it == serviceConfig.end())
+    {
+        KT_T(0, "dds: service '%s' is not in the configuration - its types are unknown", serviceName);
+        return false;
+    }
+
+    serviceInfo.request = eprosima::ddsenabler::participants::TopicInfo(it->second.request, SERVICE_QOS);
+    serviceInfo.reply   = eprosima::ddsenabler::participants::TopicInfo(it->second.reply,   SERVICE_QOS);
+
+    return true;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceNotification - a service was discovered on the domain
+//
+// Nothing is kept: what this plugin would need from it - the type names - it
+// already has from its own configuration, and it must, because a service that
+// nobody has announced yet still has to be invocable. So this is a trace and
+// no more, and it is worth having as one: "the peer is there" is the first
+// thing anybody asks when a request goes unanswered.
+//
+void serviceNotification(const char* serviceName, const eprosima::ddsenabler::participants::ServiceInfo& serviceInfo)
+{
+    if (serviceName == nullptr)
+        return;
+
+    KT_T(0, "dds: service '%s' discovered (request '%s', reply '%s')",
+         serviceName, serviceInfo.request.type_name.c_str(), serviceInfo.reply.type_name.c_str());
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceReplyNotification - an answer came back
+//
+// ⚠ AN ENABLER THREAD, as dataNotification.
+//
+// The requestId is not passed on. It correlates a reply to a request, which is
+// this plugin's business and finishes here: the broker identifies the exchange
+// by its ENDPOINT, because an endpoint is what a Channel binds to an attribute.
+//
+void serviceReplyNotification(const char* serviceName, const char* json, uint64_t requestId, int64_t publishTime)
+{
+    if ((serviceName == nullptr) || (json == nullptr) || (broker == nullptr))
+        return;
+
+    //
+    // ⚠ abiVersion FIRST, and short-circuit order is doing real work here: a
+    // broker built against ABI 1 allocated a struct that ENDS before
+    // sampleQualifiedIn, so reading the member to test it for null would be
+    // reading past it.
+    //
+    if ((broker->abiVersion < 2) || (broker->sampleQualifiedIn == nullptr))
+    {
+        KT_W("dds: a reply arrived on service '%s' but the host cannot take one - it predates the service contract", serviceName);
+        return;
+    }
+
+    KT_T(0, "dds: reply to request %llu on service '%s'", (unsigned long long) requestId, serviceName);
+
+    //
+    // A reply comes wrapped exactly as a sample does, and for the same reason -
+    // so it is unwrapped in the same place. Only what the server answered
+    // crosses the seam.
+    //
+    std::string payload;
+
+    if (sampleUnwrap(nullptr, json, payload) == true)
+        broker->sampleQualifiedIn(bridgeAlias, serviceName, nullptr, DDS_SERVICE_REPLY, payload.c_str(), publishTime);
+    else
+        broker->sampleQualifiedIn(bridgeAlias, serviceName, nullptr, DDS_SERVICE_REPLY, json, publishTime);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceRequestNotification - somebody is asking US something
+//
+// ⛔ NEVER REACHED IN THE BROKER, which announces no services and therefore
+// receives no requests. It is the peer side, and it is here so that a host that
+// is not a broker can be the thing the broker talks to.
+//
+void serviceRequestNotification(const char* serviceName, const char* json, uint64_t requestId, int64_t publishTime)
+{
+    if ((serviceName == nullptr) || (json == nullptr))
+        return;
+
+    BridgeServiceRequestFunc handler = nullptr;
+
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+        auto it = served.find(serviceName);
+
+        if (it != served.end())
+            handler = it->second;
+    }
+
+    if (handler == nullptr)
+    {
+        KT_W("dds: a request arrived on service '%s', which nothing here answers", serviceName);
+        return;
+    }
+
+    KT_T(0, "dds: request %llu on service '%s'", (unsigned long long) requestId, serviceName);
+
+    //
+    // Unwrapped like everything else the Enabler delivers. A host answering a
+    // request is handed what the client ASKED, not the envelope it travelled
+    // in - the same seam, in the same shape, in both directions.
+    //
+    std::string payload;
+
+    if (sampleUnwrap(nullptr, json, payload) == true)
+        handler(bridgeAlias, serviceName, payload.c_str(), requestId, publishTime);
+    else
+        handler(bridgeAlias, serviceName, json, requestId, publishTime);
+}
+
+
+
 // -----------------------------------------------------------------------------
 //
 // sampleUnwrap - the message inside the Enabler's envelope
@@ -321,6 +547,19 @@ bool topicQuery(const char* topicName, eprosima::ddsenabler::participants::Topic
 // that changes it, or another producer - and the caller then passes the json on
 // untouched rather than dropping a sample it could have delivered.
 //
+// ⭐ topicName MAY BE NULL, and for a reply it has to be. The envelope is keyed
+// by the TOPIC the message travelled on, and a service's reply travels on a
+// topic whose name is derived from the service's by a convention that belongs
+// to the RPC protocol in use - 'rr/<service>Reply' for ROS 2, something else
+// for plain DDS. Rebuilding that name here would be this plugin guessing at
+// something the Enabler already knows.
+//
+// So the envelope is recognised by its SHAPE instead: of its three members, one
+// is the topic and it is the one holding 'data'. Which is also the better
+// answer for topics, and it is used for them too - a sample whose envelope is
+// keyed by a name other than the one it was delivered under used to fall
+// through unwrapped, and the whole envelope became the value.
+//
 static bool sampleUnwrap(const char* topicName, const char* json, std::string& payload)
 {
     //
@@ -337,7 +576,24 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
 
     Kjson*  kjP    = kjBufferCreate(&kjson, &kalloc);
     KjNode* treeP  = kjParse(kjP, (char*) copy.c_str());
-    KjNode* topicP = ((treeP  != nullptr) && (treeP->type == KjObject))  ? kjLookup(treeP, topicName) : nullptr;
+    KjNode* topicP = ((treeP != nullptr) && (treeP->type == KjObject) && (topicName != nullptr)) ? kjLookup(treeP, topicName) : nullptr;
+
+    //
+    // Not keyed by the name we expected, or we had no name to expect: the one
+    // member that is an object carrying 'data' is the message.
+    //
+    if ((topicP == nullptr) && (treeP != nullptr) && (treeP->type == KjObject))
+    {
+        for (KjNode* childP = treeP->value.firstChildP; childP != nullptr; childP = childP->next)
+        {
+            if ((childP->type == KjObject) && (kjLookup(childP, "data") != nullptr))
+            {
+                topicP = childP;
+                break;
+            }
+        }
+    }
+
     KjNode* dataP  = ((topicP != nullptr) && (topicP->type == KjObject)) ? kjLookup(topicP, "data")   : nullptr;
     KjNode* sampleP = ((dataP != nullptr) && (dataP->type == KjObject))  ? dataP->value.firstChildP   : nullptr;
 
@@ -382,7 +638,7 @@ void dataNotification(const char* topicName, const char* json, int64_t publishTi
 
         if (it != carried.end())
         {
-            if (it->second == BridgeDirectionOut)
+            if (it->second.direction == BridgeDirectionOut)
                 return;                                // outbound only
 
             claimed = true;
@@ -500,6 +756,39 @@ int init(const char* configFile, const BridgeBroker* brokerP)
                 KT_I("dds: types are kept in '%s'", typesDirectory.c_str());
             }
 
+            //
+            // ⭐ THE SAME ENTRIES THE BROKER READS, AND A DIFFERENT HALF OF THEM.
+            //
+            // A services entry says two things: which entity attribute the
+            // service is bound to, which is NGSI-LD and the broker's business,
+            // and what its request and reply types are called, which is DDS and
+            // is this plugin's. Neither side parses the other's half, and the
+            // deployment describes one service in one place.
+            //
+            KjNode* servicesP = (ngP != nullptr) ? kjLookup(ngP, "services") : nullptr;
+
+            if (servicesP != nullptr)
+            {
+                std::lock_guard<std::mutex> guard(serviceMutex);
+
+                for (KjNode* entryP = servicesP->value.firstChildP; entryP != nullptr; entryP = entryP->next)
+                {
+                    if ((entryP->name == nullptr) || (entryP->type != KjObject))
+                        continue;
+
+                    KjNode*      reqP = kjLookup(entryP, "requestType");
+                    KjNode*      repP = kjLookup(entryP, "replyType");
+                    ServiceTypes types;
+
+                    types.request = ((reqP != nullptr) && (reqP->type == KjString)) ? reqP->value.s : std::string(entryP->name) + "_Request";
+                    types.reply   = ((repP != nullptr) && (repP->type == KjString)) ? repP->value.s : std::string(entryP->name) + "_Response";
+
+                    serviceConfig[entryP->name] = types;
+
+                    KT_I("dds: service '%s' (%s -> %s)", entryP->name, types.request.c_str(), types.reply.c_str());
+                }
+            }
+
             kaBufferReset(&kalloc, KTRUE);
             }
             fclose(fP);
@@ -515,10 +804,15 @@ int init(const char* configFile, const BridgeBroker* brokerP)
     callbacks.dds.type_query         = typeQuery;
     callbacks.dds.topic_query        = topicQuery;
 
+    callbacks.service.service_notification         = serviceNotification;
+    callbacks.service.service_reply_notification   = serviceReplyNotification;
+    callbacks.service.service_request_notification = serviceRequestNotification;
+    callbacks.service.service_query                = serviceQuery;
+
     //
-    // The service and action callbacks stay null on purpose - not carried yet,
-    // and a null entry is how the Enabler is told so, the same convention the
-    // BridgeDriver uses.
+    // The action callbacks stay null on purpose - not carried yet, and a null
+    // entry is how the Enabler is told so, the same convention the BridgeDriver
+    // uses.
     //
     if (eprosima::ddsenabler::create_dds_enabler(configFile, callbacks, enabler) == false)
     {
@@ -565,14 +859,26 @@ int channelAdd(const char* endpoint, BridgeChannelKind kind, BridgeDirection dir
     if ((endpoint == nullptr) || (*endpoint == 0))
         return BRIDGE_BAD_INPUT;
 
-    if (kind != BridgeChannelTopic)
-        return BRIDGE_UNSUPPORTED;                     // services and actions are not carried yet
+    if (kind == BridgeChannelAction)
+        return BRIDGE_UNSUPPORTED;                     // actions are not carried yet
 
+    //
+    // ⭐ A SERVICE CHANNEL SUBSCRIBES TO NOTHING HERE, and that is the whole
+    // difference. A topic has to be listened for, because a publisher decides
+    // on its own when to speak. A service only ever answers, and it answers the
+    // request this plugin sent - so the reply arrives through the Enabler's own
+    // reply callback, correlated to that request, whether or not anybody asked
+    // for the endpoint in advance.
+    //
+    // What the Channel buys is the other direction: the endpoint is now one
+    // this plugin will accept a serviceInvoke() for, and one whose reply the
+    // broker has somewhere to put.
+    //
     std::lock_guard<std::mutex> guard(carriedMutex);
-    carried[endpoint] = direction;
+    carried[endpoint] = { kind, direction };
     unwanted.erase(endpoint);
 
-    KT_T(0, "dds: carrying topic '%s'", endpoint);
+    KT_T(0, "dds: carrying %s '%s'", (kind == BridgeChannelService) ? "service" : "topic", endpoint);
 
     return BRIDGE_OK;
 }
@@ -614,6 +920,168 @@ int publish(const char* endpoint, const char* json)
     // std::string, right here, is the reason this file is C++.
     //
     return (enabler->publish(endpoint, json) == true) ? BRIDGE_OK : BRIDGE_ERR;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceInvoke - ask a service something
+//
+// Called on a BROKER thread, inside the request that wrote the attribute. It
+// hands the request over and returns: the answer arrives later, on an Enabler
+// thread, through serviceReplyNotification.
+//
+// ⚠ The requestId the Enabler hands back is not kept. It correlates the reply
+// the Enabler will deliver, and the Enabler does that correlation itself - it
+// tells us which service the reply is for, which is the only thing anybody
+// downstream needs. Keeping a map here would be keeping a second copy of an
+// answer we are already given.
+//
+int serviceInvoke(const char* endpoint, const char* json)
+{
+    if ((endpoint == nullptr) || (json == nullptr))
+        return BRIDGE_BAD_INPUT;
+
+    if (enabler == nullptr)
+        return BRIDGE_ERR;
+
+    uint64_t requestId = 0;
+
+    if (enabler->send_service_request(endpoint, json, requestId) == false)
+    {
+        //
+        // The two ordinary reasons, and they are worth telling apart in the
+        // log: nobody is serving the endpoint, or the payload does not fit the
+        // request type. The Enabler answers false to both.
+        //
+        KT_W("dds: could not send a request to service '%s' - no server, or the payload does not fit '%s'",
+             endpoint, json);
+        return BRIDGE_ERR;
+    }
+
+    KT_T(0, "dds: request %llu sent to service '%s'", (unsigned long long) requestId, endpoint);
+
+    return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceServe - announce a service and answer it from here on
+//
+static int serviceServe(const char* endpoint, BridgeServiceRequestFunc handler)
+{
+    if ((endpoint == nullptr) || (handler == nullptr))
+        return BRIDGE_BAD_INPUT;
+
+    if (enabler == nullptr)
+        return BRIDGE_ERR;
+
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+
+        //
+        // ⚠ The handler goes in BEFORE the announcement, not after. The moment
+        // announce_service returns, the service exists on the domain and a
+        // client that was waiting for it may already be asking - on an Enabler
+        // thread, into serviceRequestNotification, which looks in this very
+        // map. Registering afterwards leaves a window in which the first
+        // request of a run is answered by nobody.
+        //
+        served[endpoint] = handler;
+    }
+
+    if (enabler->announce_service(endpoint) == false)
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+        served.erase(endpoint);
+
+        KT_W("dds: could not announce service '%s' - are its types configured, and on disk?", endpoint);
+        return BRIDGE_ERR;
+    }
+
+    KT_I("dds: serving '%s'", endpoint);
+
+    return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceUnserve -
+//
+static int serviceUnserve(const char* endpoint)
+{
+    if (endpoint == nullptr)
+        return BRIDGE_BAD_INPUT;
+
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+
+        if (served.erase(endpoint) == 0)
+            return BRIDGE_NOT_FOUND;
+    }
+
+    if (enabler != nullptr)
+        enabler->revoke_service(endpoint);
+
+    return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceReply - answer one request
+//
+static int serviceReply(const char* endpoint, uint64_t requestId, const char* json)
+{
+    if ((endpoint == nullptr) || (json == nullptr))
+        return BRIDGE_BAD_INPUT;
+
+    if (enabler == nullptr)
+        return BRIDGE_ERR;
+
+    if (enabler->send_service_reply(endpoint, json, requestId) == false)
+    {
+        KT_W("dds: could not reply to request %llu on service '%s' - answered already, or never asked",
+             (unsigned long long) requestId, endpoint);
+        return BRIDGE_NOT_FOUND;
+    }
+
+    KT_T(0, "dds: replied to request %llu on service '%s'", (unsigned long long) requestId, endpoint);
+
+    return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// ddsServer - the peer side of this plugin
+//
+static const BridgeServer ddsServer =
+{
+    BRIDGE_ABI_VERSION,
+    serviceServe,
+    serviceUnserve,
+    serviceReply
+};
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serverIface -
+//
+// ⛔ The broker never calls this. See BridgeServer.h.
+//
+const BridgeServer* serverIface()
+{
+    return &ddsServer;
 }
 
 
