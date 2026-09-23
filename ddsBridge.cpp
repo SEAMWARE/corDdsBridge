@@ -15,6 +15,14 @@
 #include <string>                                      // std::string
 #include <vector>                                      // std::vector
 
+#include <link.h>                                      // dl_iterate_phdr, dl_phdr_info
+#include <limits.h>                                    // PATH_MAX
+#include <cstdlib>                                     // realpath
+
+#include <fastdds/config.hpp>                          // FASTDDS_VERSION_STR
+#include <fastcdr/config.h>                            // FASTCDR_VERSION_STR
+#include <ddsenabler/library/config.h>                 // DDSENABLER_VERSION_MAJOR, DDSENABLER_VERSION_MINOR
+
 #include <ddsenabler/dds_enabler_runner.hpp>           // create_dds_enabler
 #include <ddsenabler/DDSEnabler.hpp>                   // DDSEnabler
 #include <ddsenabler/CallbackSet.hpp>                  // CallbackSet
@@ -1088,11 +1096,100 @@ const BridgeServer* serverIface()
 
 // -----------------------------------------------------------------------------
 //
+// SoVersionQuery - what soVersion is looking for, and what it found
+//
+struct SoVersionQuery
+{
+    const char*  prefix;                               // "libddsenabler.so."
+    std::string  version;                              // "1.2.2", or empty
+};
+
+
+
+// -----------------------------------------------------------------------------
+//
+// soVersionSeen - one loaded shared object, offered by dl_iterate_phdr
+//
+static int soVersionSeen(struct dl_phdr_info* info, size_t size, void* dataP)
+{
+    (void) size;
+
+    SoVersionQuery* queryP = (SoVersionQuery*) dataP;
+
+    if ((info->dlpi_name == nullptr) || (info->dlpi_name[0] == 0) || (queryP->version.empty() == false))
+        return 0;
+
+    const char* slash = strrchr(info->dlpi_name, '/');
+    const char* base  = (slash != nullptr) ? slash + 1 : info->dlpi_name;
+
+    if (strncmp(base, queryP->prefix, strlen(queryP->prefix)) != 0)
+        return 0;
+
+    //
+    // ⭐ THE PATH IS THE SONAME, AND THE SONAME IS NOT THE VERSION. The loader
+    // records what it was asked for - libddsenabler.so.1 - which is a symlink
+    // carrying only the major. Resolving it reaches the real file, whose name
+    // carries all of it.
+    //
+    char        resolved[PATH_MAX];
+    const char* pathP = (realpath(info->dlpi_name, resolved) != nullptr) ? resolved : info->dlpi_name;
+    const char* soP   = strstr(pathP, ".so.");
+
+    if (soP != nullptr)
+        queryP->version = soP + 4;
+
+    return 1;                                          // found it - stop walking
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// soVersion - the version in a LOADED library's file name
+//
+// ⭐ WHAT IS LOADED, NOT WHAT THIS WAS COMPILED AGAINST, and for a version
+// endpoint that is the difference that matters. A plugin is a separate shared
+// object built at a different time than the stack it links - the whole point of
+// it being a plugin - so its headers answer a question nobody asked. The file
+// the loader actually opened is the honest answer.
+//
+// ⚠ It is also the only way to get the Enabler's full version at all: its
+// config.h defines DDSENABLER_VERSION_MAJOR and _MINOR and stops there, so the
+// macros cannot tell 1.2.0 from 1.2.2 - which is exactly the distinction that
+// matters, those being two different DDS stacks.
+//
+// Falls back to the caller's compiled-in string when the walk finds nothing:
+// a version report that says something slightly stale beats one that says
+// nothing.
+//
+static std::string soVersion(const char* prefix, const char* fallback)
+{
+    SoVersionQuery query{prefix, ""};
+
+    dl_iterate_phdr(soVersionSeen, &query);
+
+    return (query.version.empty() == false) ? query.version : std::string(fallback);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // versionInfo -
+//
+// Named libraries were not enough: "DDS Enabler, Fast DDS" tells an operator
+// which stack is linked and nothing about WHICH of it, and eProsima moves fast
+// enough that the answer changes underneath a deployment.
 //
 const char* versionInfo()
 {
-    snprintf(versionBuffer, sizeof(versionBuffer), "dds %s (DDS Enabler, Fast DDS)", CORDDSBRIDGE_VERSION);
+    static std::string fastdds   = soVersion("libfastdds.so.",     FASTDDS_VERSION_STR);
+    static std::string fastcdr   = soVersion("libfastcdr.so.",     FASTCDR_VERSION_STR);
+    static std::string enablerFb = std::to_string(DDSENABLER_VERSION_MAJOR) + "." + std::to_string(DDSENABLER_VERSION_MINOR);
+    static std::string enabler   = soVersion("libddsenabler.so.",  enablerFb.c_str());
+
+    snprintf(versionBuffer, sizeof(versionBuffer), "dds %s (Fast DDS %s, Fast CDR %s, DDS Enabler %s)",
+             CORDDSBRIDGE_VERSION, fastdds.c_str(), fastcdr.c_str(), enabler.c_str());
 
     return versionBuffer;
 }
