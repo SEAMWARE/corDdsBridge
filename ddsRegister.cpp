@@ -61,5 +61,14 @@ extern "C" void bridgeRegister(BridgeDriver* driverP)
     if (hostAbi >= 3)
         driverP->serviceInvokeTracked = coraine::dds::serviceInvokeTracked;
 
+    //
+    // ABI 4: goals.
+    //
+    if (hostAbi >= 4)
+    {
+        driverP->actionGoalSend   = coraine::dds::actionGoalSend;
+        driverP->actionGoalCancel = coraine::dds::actionGoalCancel;
+    }
+
     driverP->abiVersion = BRIDGE_ABI_VERSION;
 }

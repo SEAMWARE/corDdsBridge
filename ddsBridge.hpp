@@ -58,6 +58,8 @@ int   channelDel(const char* endpoint);
 int   publish(const char* endpoint, const char* json);
 int   serviceInvoke(const char* endpoint, const char* json);
 int   serviceInvokeTracked(const char* endpoint, const char* json, uint64_t token);
+int   actionGoalSend(const char* endpoint, const char* json, uint64_t token);
+int   actionGoalCancel(const char* endpoint, uint64_t token);
 const BridgeServer* serverIface();
 const char* versionInfo();
 

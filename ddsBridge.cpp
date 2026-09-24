@@ -367,6 +367,26 @@ struct ServiceTypes
 };
 
 std::map<std::string, ServiceTypes>  serviceConfig;    // from the configuration file
+
+
+
+// -----------------------------------------------------------------------------
+//
+// Actions - what the configuration says about each, and the QoS they announce
+//
+// A ROS 2 action is five DDS entities, and every one of their types follows
+// from the action's own: <type>_SendGoal_Request_, _SendGoal_Response_,
+// _GetResult_Request_, _GetResult_Response_ and _FeedbackMessage_, plus the two
+// every action shares, action_msgs' CancelGoal and GoalStatusArray. So an
+// actions entry names the action type once ("type") and the rest is derived.
+//
+// The status topic is TRANSIENT LOCAL, as ROS 2 publishes it - a client that
+// joins late still reads where each goal stands. The rest is reliable and
+// volatile, as a service's topics are.
+//
+#define ACTION_STATUS_QOS  "reliability: true\ndurability: true\nownership: false\nkeyed: false"
+
+std::map<std::string, std::string>   actionConfig;     // endpoint -> action type, from the configuration file
 std::mutex                           serviceMutex;
 
 //
@@ -467,7 +487,10 @@ void serviceNotification(const char* serviceName, const eprosima::ddsenabler::pa
 enum UpcallKind
 {
     UpcallData,
-    UpcallReply
+    UpcallReply,
+    UpcallGoalFeedback,
+    UpcallGoalStatus,
+    UpcallGoalResult
 };
 
 struct Upcall
@@ -477,6 +500,11 @@ struct Upcall
     std::string  json;
     uint64_t     requestId;
     int64_t      publishTime;
+
+    // A goal's events only
+    eprosima::ddsenabler::participants::UUID  goalUuid;
+    int                                       statusCode;
+    std::string                               statusMessage;
 };
 
 static const size_t              UPCALL_QUEUE_MAX = 10000;
@@ -489,6 +517,8 @@ static bool                      upcallRunning = false;
 
 static void dataDeliver(const char* topicName, const char* json, int64_t publishTime);
 static void replyDeliver(const char* serviceName, const char* json, uint64_t requestId, int64_t publishTime);
+static void goalDeliver(const Upcall& upcall);
+static void goalSweep();
 
 
 
@@ -505,7 +535,52 @@ static void upcallQueueAdd(UpcallKind kind, const char* endpoint, const char* js
     if (upcallRunning == false)
         return;                                        // closing - nothing reaches the broker from here on
 
-    upcallQueue.push_back(Upcall{ kind, endpoint, json, requestId, publishTime });
+    Upcall upcall;
+
+    upcall.kind        = kind;
+    upcall.endpoint    = endpoint;
+    upcall.json        = (json != nullptr) ? json : "";
+    upcall.requestId   = requestId;
+    upcall.publishTime = publishTime;
+    upcall.statusCode  = 0;
+
+    upcallQueue.push_back(std::move(upcall));
+    upcallReady.notify_one();
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// upcallGoalQueueAdd - a goal's event, on an ENABLER thread: copy, queue, return
+//
+static void upcallGoalQueueAdd(UpcallKind                                       kind,
+                               const char*                                      actionName,
+                               const eprosima::ddsenabler::participants::UUID&  goalUuid,
+                               const char*                                      json,
+                               int                                              statusCode,
+                               const char*                                      statusMessage,
+                               int64_t                                          publishTime)
+{
+    std::unique_lock<std::mutex> lock(upcallMutex);
+
+    upcallRoom.wait(lock, [] { return (upcallRunning == false) || (upcallQueue.size() < UPCALL_QUEUE_MAX); });
+
+    if (upcallRunning == false)
+        return;
+
+    Upcall upcall;
+
+    upcall.kind          = kind;
+    upcall.endpoint      = actionName;
+    upcall.json          = (json != nullptr) ? json : "";
+    upcall.requestId     = 0;
+    upcall.publishTime   = publishTime;
+    upcall.goalUuid      = goalUuid;
+    upcall.statusCode    = statusCode;
+    upcall.statusMessage = (statusMessage != nullptr) ? statusMessage : "";
+
+    upcallQueue.push_back(std::move(upcall));
     upcallReady.notify_one();
 }
 
@@ -524,10 +599,22 @@ static void upcallLoop()
         {
             std::unique_lock<std::mutex> lock(upcallMutex);
 
-            upcallReady.wait(lock, [] { return (upcallRunning == false) || (upcallQueue.empty() == false); });
+            //
+            // Timed: a goal whose result never comes is ended by goalSweep(),
+            // and that has to happen whether or not anything else arrives.
+            //
+            upcallReady.wait_for(lock, std::chrono::milliseconds(200),
+                                 [] { return (upcallRunning == false) || (upcallQueue.empty() == false); });
 
             if (upcallRunning == false)
                 return;
+
+            if (upcallQueue.empty() == true)
+            {
+                lock.unlock();
+                goalSweep();
+                continue;
+            }
 
             upcall = std::move(upcallQueue.front());
             upcallQueue.pop_front();
@@ -536,8 +623,10 @@ static void upcallLoop()
 
         if (upcall.kind == UpcallData)
             dataDeliver(upcall.endpoint.c_str(), upcall.json.c_str(), upcall.publishTime);
-        else
+        else if (upcall.kind == UpcallReply)
             replyDeliver(upcall.endpoint.c_str(), upcall.json.c_str(), upcall.requestId, upcall.publishTime);
+        else
+            goalDeliver(upcall);
     }
 }
 
@@ -925,6 +1014,426 @@ void logConsumer(const char* fileName, int lineNo, const char* funcName, int cat
     broker->logFunction(severity, fileName, lineNo, funcName, msg);
 }
 
+// -----------------------------------------------------------------------------
+//
+// Goals - the broker's token, by the Enabler's goal UUID
+//
+// The broker names a goal by the token it chose (actionGoalSend); the Enabler
+// names it by the UUID send_action_goal makes, and every event it delivers
+// carries only that. This is where the two meet.
+//
+// ⭐ ONE FINAL EVENT PER GOAL, AND IT IS THE LATER OF TWO. An accepted goal ends
+// with a terminal status (on the status topic) AND a result (the get-result
+// reply), in either order, on different Enabler threads - the Enabler keeps the
+// goal until it has seen both. So the first of the two goes to the broker at
+// once, and the second goes with final set. Nothing is held back.
+//
+// A goal with no result to come ends on its status alone: REJECTED (never
+// accepted, so never asked for a result), and the Enabler's own "Action goal
+// aborted", sent when it could not even ask for the result. And in case a
+// result never comes for another reason, goalSweep() ends a goal RESULT_WAIT
+// after its terminal status, with a final event of its own.
+//
+// goalMutex is taken on the delivery thread and by actionGoalSend/Cancel, across
+// their Enabler calls - never on an Enabler thread (see Upcalls), so it cannot
+// be part of a cycle with the Enabler's lock.
+//
+struct DdsGoal
+{
+    uint64_t                                  token;
+    std::string                               endpoint;
+    std::string                               uuidText;
+    int                                       state        = BridgeGoalUnknown;
+    bool                                      terminalSeen = false;
+    bool                                      resultSeen   = false;
+    std::chrono::steady_clock::time_point     terminalAt;
+};
+
+static std::mutex                                  goalMutex;
+static std::map<std::string, DdsGoal>              goalsByUuid;     // uuidText -> goal
+static std::map<uint64_t, std::string>             uuidByToken;     // token    -> uuidText
+static const std::chrono::seconds                  RESULT_WAIT(5);
+
+#define DDS_ACTION_FEEDBACK  "ddsActionFeedback"
+#define DDS_ACTION_STATUS    "ddsActionStatus"
+#define DDS_ACTION_RESULT    "ddsActionResult"
+
+
+
+// -----------------------------------------------------------------------------
+//
+// uuidText - the canonical 8-4-4-4-12 form
+//
+static std::string uuidText(const eprosima::ddsenabler::participants::UUID& uuid)
+{
+    char buf[37];
+    int  n = 0;
+
+    for (int ix = 0; ix < 16; ix++)
+    {
+        n += snprintf(&buf[n], sizeof(buf) - n, "%02x", uuid[ix]);
+
+        if ((ix == 3) || (ix == 5) || (ix == 7) || (ix == 9))
+            buf[n++] = '-';
+    }
+
+    buf[n] = 0;
+    return std::string(buf);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// goalState - the Enabler's StatusCode, as the seam's BridgeGoalState
+//
+static int goalState(int statusCode, int current)
+{
+    using eprosima::ddsenabler::participants::StatusCode;
+
+    switch ((StatusCode) statusCode)
+    {
+    case StatusCode::ACCEPTED:   return BridgeGoalAccepted;
+    case StatusCode::EXECUTING:  return BridgeGoalExecuting;
+    case StatusCode::CANCELING:  return BridgeGoalCanceling;
+    case StatusCode::SUCCEEDED:  return BridgeGoalSucceeded;
+    case StatusCode::CANCELED:   return BridgeGoalCanceled;
+    case StatusCode::ABORTED:    return BridgeGoalAborted;
+    case StatusCode::REJECTED:   return BridgeGoalRejected;
+    case StatusCode::TIMEOUT:    return BridgeGoalFailed;
+    case StatusCode::FAILED:     return BridgeGoalFailed;
+    default:                     return current;       // UNKNOWN, CANCEL_REQUEST_FAILED: not a state
+    }
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// statusName - the name ddsActionStatus carries, the Enabler's own
+//
+static const char* statusName(int statusCode)
+{
+    using eprosima::ddsenabler::participants::StatusCode;
+
+    switch ((StatusCode) statusCode)
+    {
+    case StatusCode::ACCEPTED:              return "ACCEPTED";
+    case StatusCode::EXECUTING:             return "EXECUTING";
+    case StatusCode::CANCELING:             return "CANCELING";
+    case StatusCode::SUCCEEDED:             return "SUCCEEDED";
+    case StatusCode::CANCELED:              return "CANCELED";
+    case StatusCode::ABORTED:               return "ABORTED";
+    case StatusCode::REJECTED:              return "REJECTED";
+    case StatusCode::TIMEOUT:               return "TIMEOUT";
+    case StatusCode::FAILED:                return "FAILED";
+    case StatusCode::CANCEL_REQUEST_FAILED: return "CANCEL_REQUEST_FAILED";
+    default:                                return "UNKNOWN";
+    }
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// statusJson - { "code": ..., "message": ... }
+//
+static std::string statusJson(const char* code, const std::string& message)
+{
+    std::string out = "{\"code\":\"";
+
+    out += code;
+    out += "\",\"message\":\"";
+
+    for (char c : message)
+    {
+        if ((c == '"') || (c == '\\'))
+            out += '\\';
+
+        if ((unsigned char) c >= 0x20)
+            out += c;
+    }
+
+    out += "\"}";
+    return out;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// goalEvent - hand one event of a goal to the broker. Caller holds goalMutex.
+//
+static void goalEvent(const DdsGoal& goal, bool final, const char* subAttrName, const char* json, int64_t publishTime)
+{
+    if ((broker == nullptr) || (broker->abiVersion < 4) || (broker->goalEventIn == nullptr))
+        return;
+
+    std::string alias = "urn:goal:" + goal.uuidText;
+
+    broker->goalEventIn(bridgeAlias, goal.endpoint.c_str(), goal.token, goal.uuidText.c_str(), alias.c_str(),
+                        goal.state, final, subAttrName, json, publishTime);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// goalForget - the goal has had its final event. Caller holds goalMutex.
+//
+static void goalForget(const std::string& text)
+{
+    auto it = goalsByUuid.find(text);
+
+    if (it == goalsByUuid.end())
+        return;
+
+    uuidByToken.erase(it->second.token);
+    goalsByUuid.erase(it);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// isCancelReply - is this "status" the Enabler's answer to a CANCEL request?
+//
+// ⚠ The Enabler reports the reply to a cancel request through the SAME status
+// callback, with the SAME codes, as the goal's own status: CANCELED there means
+// "your cancel was accepted" (the goal is canceling, not canceled), REJECTED
+// means the CANCEL was refused, not the goal. Only the message tells them apart
+// - its cancel-reply messages are the ones that begin "Action cancel". Fragile,
+// and worth an issue upstream; a code of its own would settle it.
+//
+static bool isCancelReply(const std::string& message)
+{
+    return message.compare(0, 13, "Action cancel") == 0;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// goalDeliver - a goal's event, on the delivery thread
+//
+static void goalDeliver(const Upcall& upcall)
+{
+    std::lock_guard<std::mutex> guard(goalMutex);
+
+    std::string text = uuidText(upcall.goalUuid);
+    auto        it   = goalsByUuid.find(text);
+
+    if (it == goalsByUuid.end())
+    {
+        KT_T(0, "dds: an event for goal %s on '%s' - not a goal of ours, dropped", text.c_str(), upcall.endpoint.c_str());
+        return;
+    }
+
+    DdsGoal& goal = it->second;
+
+    if (upcall.kind == UpcallGoalFeedback)
+    {
+        goal.state = BridgeGoalExecuting;
+        goalEvent(goal, false, DDS_ACTION_FEEDBACK, upcall.json.c_str(), upcall.publishTime);
+        return;
+    }
+
+    if (upcall.kind == UpcallGoalResult)
+    {
+        goal.resultSeen = true;
+
+        //
+        // The later of the two ends the goal. The terminal status that came
+        // first already set the state this event carries.
+        //
+        goalEvent(goal, goal.terminalSeen, DDS_ACTION_RESULT, upcall.json.c_str(), upcall.publishTime);
+
+        if (goal.terminalSeen == true)
+            goalForget(text);
+
+        return;
+    }
+
+    //
+    // A status - the goal's own, or the reply to a cancel request.
+    //
+    using eprosima::ddsenabler::participants::StatusCode;
+
+    if (isCancelReply(upcall.statusMessage) == true)
+    {
+        //
+        // Accepted: the goal is canceling, its end comes on the status topic.
+        // Refused, or unknown to the server: the goal goes on as it was, and
+        // ddsActionStatus says why the cancel did not happen.
+        //
+        const char* code = "CANCEL_REQUEST_FAILED";
+
+        if ((StatusCode) upcall.statusCode == StatusCode::CANCELED)
+        {
+            goal.state = BridgeGoalCanceling;
+            code       = "CANCELING";
+        }
+
+        std::string json = statusJson(code, upcall.statusMessage);
+        goalEvent(goal, false, DDS_ACTION_STATUS, json.c_str(), upcall.publishTime);
+        return;
+    }
+
+    goal.state = goalState(upcall.statusCode, goal.state);
+
+    std::string json     = statusJson(statusName(upcall.statusCode), upcall.statusMessage);
+    bool        terminal = BRIDGE_GOAL_TERMINAL(goal.state);
+
+    if (terminal == false)
+    {
+        goalEvent(goal, false, DDS_ACTION_STATUS, json.c_str(), upcall.publishTime);
+        return;
+    }
+
+    if (goal.terminalSeen == true)
+        return;                                        // a terminal status repeated on the (durable) status topic
+
+    goal.terminalSeen = true;
+    goal.terminalAt   = std::chrono::steady_clock::now();
+
+    //
+    // No result will come for a goal that was never accepted, nor for one the
+    // Enabler could not ask a result for ("Action goal aborted", from the goal
+    // reply rather than the server) - the status is the end of it.
+    //
+    bool noResult = (goal.state == BridgeGoalRejected) || (upcall.statusMessage == "Action goal aborted");
+    bool final    = (goal.resultSeen == true) || (noResult == true);
+
+    goalEvent(goal, final, DDS_ACTION_STATUS, json.c_str(), upcall.publishTime);
+
+    if (final == true)
+        goalForget(text);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// goalSweep - end the goals whose result has not come RESULT_WAIT after their end
+//
+static void goalSweep()
+{
+    std::lock_guard<std::mutex> guard(goalMutex);
+    auto                        now = std::chrono::steady_clock::now();
+
+    for (auto it = goalsByUuid.begin(); it != goalsByUuid.end(); )
+    {
+        DdsGoal& goal = it->second;
+
+        if ((goal.terminalSeen == true) && (goal.resultSeen == false) && (now - goal.terminalAt > RESULT_WAIT))
+        {
+            KT_W("dds: goal %s on '%s' ended without a result - closing it", goal.uuidText.c_str(), goal.endpoint.c_str());
+            goalEvent(goal, true, nullptr, nullptr, 0);
+            uuidByToken.erase(goal.token);
+            it = goalsByUuid.erase(it);
+        }
+        else
+            ++it;
+    }
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// The Enabler's action-client callbacks - queue only, as every callback here
+//
+void actionFeedbackNotification(const char* actionName, const char* json, const eprosima::ddsenabler::participants::UUID& goalId, int64_t publishTime)
+{
+    if ((actionName == nullptr) || (json == nullptr))
+        return;
+
+    std::string payload;
+    const char* answer = (sampleUnwrap(nullptr, json, payload) == true) ? payload.c_str() : json;
+
+    upcallGoalQueueAdd(UpcallGoalFeedback, actionName, goalId, answer, 0, nullptr, publishTime);
+}
+
+void actionResultNotification(const char* actionName, const char* json, const eprosima::ddsenabler::participants::UUID& goalId, int64_t publishTime)
+{
+    if ((actionName == nullptr) || (json == nullptr))
+        return;
+
+    std::string payload;
+    const char* answer = (sampleUnwrap(nullptr, json, payload) == true) ? payload.c_str() : json;
+
+    upcallGoalQueueAdd(UpcallGoalResult, actionName, goalId, answer, 0, nullptr, publishTime);
+}
+
+void actionStatusNotification(const char*                                      actionName,
+                              const eprosima::ddsenabler::participants::UUID&  goalId,
+                              eprosima::ddsenabler::participants::StatusCode   statusCode,
+                              const char*                                      statusMessage,
+                              int64_t                                          publishTime)
+{
+    if (actionName == nullptr)
+        return;
+
+    upcallGoalQueueAdd(UpcallGoalStatus, actionName, goalId, nullptr, (int) statusCode, statusMessage, publishTime);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// actionNotification - an action was discovered on the domain
+//
+void actionNotification(const char* actionName, const eprosima::ddsenabler::participants::ActionInfo& actionInfo)
+{
+    if (actionName == nullptr)
+        return;
+
+    KT_T(0, "dds: action '%s' discovered (goal '%s')", actionName, actionInfo.goal.request.type_name.c_str());
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// actionQuery - the Enabler needs an action's types
+//
+// FALSE for an action the configuration does not name, as serviceQuery.
+//
+bool actionQuery(const char* actionName, eprosima::ddsenabler::participants::ActionInfo& actionInfo)
+{
+    using eprosima::ddsenabler::participants::TopicInfo;
+    using eprosima::ddsenabler::participants::ServiceInfo;
+
+    if (actionName == nullptr)
+        return false;
+
+    std::string type;
+
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+        auto it = actionConfig.find(actionName);
+
+        if (it == actionConfig.end())
+        {
+            KT_T(0, "dds: action '%s' is not in the configuration - its types are unknown", actionName);
+            return false;
+        }
+
+        type = it->second;
+    }
+
+    actionInfo.goal     = ServiceInfo(TopicInfo(type + "_SendGoal_Request_",   SERVICE_QOS), TopicInfo(type + "_SendGoal_Response_",   SERVICE_QOS));
+    actionInfo.result   = ServiceInfo(TopicInfo(type + "_GetResult_Request_",  SERVICE_QOS), TopicInfo(type + "_GetResult_Response_",  SERVICE_QOS));
+    actionInfo.cancel   = ServiceInfo(TopicInfo("action_msgs::srv::dds_::CancelGoal_Request_",  SERVICE_QOS),
+                                      TopicInfo("action_msgs::srv::dds_::CancelGoal_Response_", SERVICE_QOS));
+    actionInfo.feedback = TopicInfo(type + "_FeedbackMessage_", SERVICE_QOS);
+    actionInfo.status   = TopicInfo("action_msgs::msg::dds_::GoalStatusArray_", ACTION_STATUS_QOS);
+
+    return true;
+}
+
+
+
 }  // anonymous namespace
 
 
@@ -1021,6 +1530,35 @@ int init(const char* configFile, const BridgeBroker* brokerP)
                 }
             }
 
+            //
+            // Actions, the same way: the broker reads the NGSI-LD half, this
+            // plugin reads "type" - the ROS 2 action type every one of the
+            // action's DDS types is derived from (see actionQuery).
+            //
+            KjNode* actionsP = (ngP != nullptr) ? kjLookup(ngP, "actions") : nullptr;
+
+            if (actionsP != nullptr)
+            {
+                std::lock_guard<std::mutex> guard(serviceMutex);
+
+                for (KjNode* entryP = actionsP->value.firstChildP; entryP != nullptr; entryP = entryP->next)
+                {
+                    if ((entryP->name == nullptr) || (entryP->type != KjObject))
+                        continue;
+
+                    KjNode* typeP = kjLookup(entryP, "type");
+
+                    if ((typeP == nullptr) || (typeP->type != KjString))
+                    {
+                        KT_W("dds: action '%s' names no \"type\" - its goals cannot be sent", entryP->name);
+                        continue;
+                    }
+
+                    actionConfig[entryP->name] = typeP->value.s;
+                    KT_I("dds: action '%s' (%s)", entryP->name, typeP->value.s);
+                }
+            }
+
             kaBufferReset(&kalloc, KTRUE);
             }
             fclose(fP);
@@ -1042,10 +1580,15 @@ int init(const char* configFile, const BridgeBroker* brokerP)
     callbacks.service.service_query                = serviceQuery;
 
     //
-    // The action callbacks stay null on purpose - not carried yet, and a null
-    // entry is how the Enabler is told so, the same convention the BridgeDriver
-    // uses.
+    // The action CLIENT side. The server side (goal and cancel requests) stays
+    // null: the broker sends goals, it does not run them.
     //
+    callbacks.action.action_notification          = actionNotification;
+    callbacks.action.action_feedback_notification = actionFeedbackNotification;
+    callbacks.action.action_status_notification   = actionStatusNotification;
+    callbacks.action.action_result_notification   = actionResultNotification;
+    callbacks.action.action_query                 = actionQuery;
+
     //
     // Before the Enabler exists: its first callback needs somewhere to queue.
     //
@@ -1084,6 +1627,13 @@ void close()
 
     enabler.reset();
     upcallsStop();
+
+    {
+        std::lock_guard<std::mutex> guard(goalMutex);
+        goalsByUuid.clear();
+        uuidByToken.clear();
+    }
+
     broker = nullptr;
 }
 
@@ -1097,9 +1647,6 @@ int channelAdd(const char* endpoint, BridgeChannelKind kind, BridgeDirection dir
 {
     if ((endpoint == nullptr) || (*endpoint == 0))
         return BRIDGE_BAD_INPUT;
-
-    if (kind == BridgeChannelAction)
-        return BRIDGE_UNSUPPORTED;                     // actions are not carried yet
 
     //
     // ⭐ A SERVICE CHANNEL SUBSCRIBES TO NOTHING HERE, and that is the whole
@@ -1117,7 +1664,7 @@ int channelAdd(const char* endpoint, BridgeChannelKind kind, BridgeDirection dir
     carried[endpoint] = { kind, direction };
     unwanted.erase(endpoint);
 
-    KT_T(0, "dds: carrying %s '%s'", (kind == BridgeChannelService) ? "service" : "topic", endpoint);
+    KT_T(0, "dds: carrying %s '%s'", (kind == BridgeChannelAction) ? "action" : (kind == BridgeChannelService) ? "service" : "topic", endpoint);
 
     return BRIDGE_OK;
 }
@@ -1250,6 +1797,95 @@ int serviceInvokeTracked(const char* endpoint, const char* json, uint64_t token)
 
     KT_T(0, "dds: request %llu sent to service '%s', waited for (token %llu)",
          (unsigned long long) requestId, endpoint, (unsigned long long) token);
+
+    return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// actionGoalSend - send a goal, ABI 4
+//
+// goalMutex is held across send_action_goal, and that is safe only because no
+// Enabler thread ever takes it (see Upcalls): the UUID exists once the send
+// returns, and an event for it may be on the delivery thread by then - holding
+// the lock makes that event wait for the goal to be registered instead of
+// being dropped as not ours.
+//
+int actionGoalSend(const char* endpoint, const char* json, uint64_t token)
+{
+    if ((endpoint == nullptr) || (json == nullptr) || (token == 0))
+        return BRIDGE_BAD_INPUT;
+
+    if (enabler == nullptr)
+        return BRIDGE_ERR;
+
+    std::lock_guard<std::mutex> guard(goalMutex);
+
+    eprosima::ddsenabler::participants::UUID uuid;
+
+    if (enabler->send_action_goal(endpoint, json, uuid) == false)
+    {
+        KT_W("dds: could not send a goal to action '%s' - no server, or the goal does not fit its type", endpoint);
+        return BRIDGE_ERR;
+    }
+
+    DdsGoal goal;
+
+    goal.token    = token;
+    goal.endpoint = endpoint;
+    goal.uuidText = uuidText(uuid);
+
+    goalsByUuid[goal.uuidText] = goal;
+    uuidByToken[token]         = goal.uuidText;
+
+    KT_T(0, "dds: goal %s sent to action '%s' (token %llu)", goal.uuidText.c_str(), endpoint, (unsigned long long) token);
+
+    return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// actionGoalCancel - ask for a goal to be cancelled, ABI 4
+//
+int actionGoalCancel(const char* endpoint, uint64_t token)
+{
+    if ((endpoint == nullptr) || (enabler == nullptr))
+        return BRIDGE_BAD_INPUT;
+
+    std::lock_guard<std::mutex> guard(goalMutex);
+    auto                        it = uuidByToken.find(token);
+
+    if (it == uuidByToken.end())
+        return BRIDGE_NOT_FOUND;
+
+    //
+    // Back from the text to the Enabler's UUID - the text is what is kept, as
+    // every event is matched by it.
+    //
+    eprosima::ddsenabler::participants::UUID uuid;
+    const std::string&                       text = it->second;
+    int                                      ix   = 0;
+
+    for (size_t c = 0; (c + 1 < text.size()) && (ix < 16); c++)
+    {
+        if (text[c] == '-')
+            continue;
+
+        uuid[ix++] = (uint8_t) std::stoi(text.substr(c, 2), nullptr, 16);
+        c++;
+    }
+
+    if (enabler->cancel_action_goal(endpoint, uuid) == false)
+    {
+        KT_W("dds: could not send the cancellation of goal %s on '%s'", text.c_str(), endpoint);
+        return BRIDGE_ERR;
+    }
+
+    KT_T(0, "dds: cancellation of goal %s sent to '%s'", text.c_str(), endpoint);
 
     return BRIDGE_OK;
 }
