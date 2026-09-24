@@ -12,6 +12,9 @@
 #include <map>                                         // std::map
 #include <mutex>                                       // std::mutex, std::recursive_mutex
 #include <chrono>                                      // std::chrono::steady_clock
+#include <condition_variable>                          // std::condition_variable
+#include <deque>                                       // std::deque
+#include <thread>                                      // std::thread
 #include <set>                                         // std::set
 #include <string>                                      // std::string
 #include <vector>                                      // std::vector
@@ -442,18 +445,179 @@ void serviceNotification(const char* serviceName, const eprosima::ddsenabler::pa
 
 // -----------------------------------------------------------------------------
 //
+// Upcalls - what the Enabler hands over, delivered to the broker by our own thread
+//
+// ⭐ EVERY ENABLER CALLBACK RUNS INSIDE THE ENABLER'S OWN LOCK (its Handler's
+// mtx_, taken in add_data and held across the notification), and the same lock
+// is taken by send_service_request. So nothing reached from a callback may wait
+// for anything a thread calling the Enabler might hold - and the broker, reached
+// from a callback, stores, takes its own locks, and may wait.
+//
+// It did deadlock, with two waited-for service requests in flight
+// (serviceInvokeTracked holds trackedMutex across send_service_request, which
+// wants mtx_; the reply callback held mtx_ and wanted trackedMutex): every
+// request after it timed out, and the broker never answered another reply.
+//
+// So a callback only copies what arrived onto this queue and returns, and one
+// thread of the plugin's own hands it to the broker, in arrival order, holding
+// none of the Enabler's locks. The queue is bounded; a callback waits for room,
+// which is the back-pressure the Enabler had anyway while the broker stored
+// each sample inside its lock.
+//
+enum UpcallKind
+{
+    UpcallData,
+    UpcallReply
+};
+
+struct Upcall
+{
+    UpcallKind   kind;
+    std::string  endpoint;
+    std::string  json;
+    uint64_t     requestId;
+    int64_t      publishTime;
+};
+
+static const size_t              UPCALL_QUEUE_MAX = 10000;
+static std::deque<Upcall>        upcallQueue;
+static std::mutex                upcallMutex;
+static std::condition_variable   upcallReady;
+static std::condition_variable   upcallRoom;
+static std::thread               upcallThread;
+static bool                      upcallRunning = false;
+
+static void dataDeliver(const char* topicName, const char* json, int64_t publishTime);
+static void replyDeliver(const char* serviceName, const char* json, uint64_t requestId, int64_t publishTime);
+
+
+
+// -----------------------------------------------------------------------------
+//
+// upcallQueueAdd - on an ENABLER thread: copy, queue, return
+//
+static void upcallQueueAdd(UpcallKind kind, const char* endpoint, const char* json, uint64_t requestId, int64_t publishTime)
+{
+    std::unique_lock<std::mutex> lock(upcallMutex);
+
+    upcallRoom.wait(lock, [] { return (upcallRunning == false) || (upcallQueue.size() < UPCALL_QUEUE_MAX); });
+
+    if (upcallRunning == false)
+        return;                                        // closing - nothing reaches the broker from here on
+
+    upcallQueue.push_back(Upcall{ kind, endpoint, json, requestId, publishTime });
+    upcallReady.notify_one();
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// upcallLoop - the delivery thread
+//
+static void upcallLoop()
+{
+    for (;;)
+    {
+        Upcall upcall;
+
+        {
+            std::unique_lock<std::mutex> lock(upcallMutex);
+
+            upcallReady.wait(lock, [] { return (upcallRunning == false) || (upcallQueue.empty() == false); });
+
+            if (upcallRunning == false)
+                return;
+
+            upcall = std::move(upcallQueue.front());
+            upcallQueue.pop_front();
+            upcallRoom.notify_one();
+        }
+
+        if (upcall.kind == UpcallData)
+            dataDeliver(upcall.endpoint.c_str(), upcall.json.c_str(), upcall.publishTime);
+        else
+            replyDeliver(upcall.endpoint.c_str(), upcall.json.c_str(), upcall.requestId, upcall.publishTime);
+    }
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// upcallsStart / upcallsStop -
+//
+// Stop discards what is still queued: it runs as the broker closes, and nothing
+// may reach the broker once close() has returned.
+//
+static void upcallsStart()
+{
+    std::lock_guard<std::mutex> guard(upcallMutex);
+
+    upcallRunning = true;
+    upcallThread  = std::thread(upcallLoop);
+}
+
+static void upcallsStop()
+{
+    {
+        std::lock_guard<std::mutex> guard(upcallMutex);
+
+        if (upcallRunning == false)
+            return;
+
+        upcallRunning = false;
+        upcallQueue.clear();
+    }
+
+    upcallReady.notify_all();
+    upcallRoom.notify_all();
+
+    if (upcallThread.joinable())
+        upcallThread.join();
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// dataNotification / serviceReplyNotification - the Enabler's callbacks: queue only
+//
+void dataNotification(const char* topicName, const char* json, int64_t publishTime)
+{
+    if ((topicName == nullptr) || (json == nullptr))
+        return;
+
+    upcallQueueAdd(UpcallData, topicName, json, 0, publishTime);
+}
+
+void serviceReplyNotification(const char* serviceName, const char* json, uint64_t requestId, int64_t publishTime)
+{
+    if ((serviceName == nullptr) || (json == nullptr))
+        return;
+
+    upcallQueueAdd(UpcallReply, serviceName, json, requestId, publishTime);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // Tracked requests - the broker's token, by the Enabler's request id
 //
 // A request somebody waits for (ddsSync, see serviceInvokeTracked) must have
 // its reply handed back with the token the broker gave it. The Enabler knows
 // the reply only by ITS request id, so this is the one place the two meet.
 //
-// ⭐ ONE LOCK ACROSS "SEND AND REMEMBER", and the reply callback takes it too.
+// ⭐ ONE LOCK ACROSS "SEND AND REMEMBER", and the reply's delivery takes it too.
 // The request id exists only once send_service_request has returned, and the
-// reply comes on an Enabler thread that is free to run before this one gets to
-// write the id down; taking the lock first makes the reply wait for the entry
-// instead of missing it and going the untracked way. Recursive, so that a
-// transport answering on the sending thread itself could not deadlock here.
+// reply may be delivered before this thread gets to write the id down; taking
+// the lock first makes the reply wait for the entry instead of missing it and
+// going the untracked way.
+//
+// ⚠ The reply WAITS on the delivery thread (see Upcalls), never on an Enabler
+// thread: send_service_request takes the Enabler's lock, and an Enabler thread
+// waiting for this one while holding it was a deadlock.
 //
 // An entry whose reply never comes is forgotten after TRACKED_KEEP: the request
 // waiting for it gave up long before, and the broker drops a reply that late
@@ -503,7 +667,7 @@ static uint64_t trackedTake(uint64_t requestId)
 // Except for a request somebody WAITS for, whose reply goes back through
 // replyIn() with the broker's own token - see the tracked requests above.
 //
-void serviceReplyNotification(const char* serviceName, const char* json, uint64_t requestId, int64_t publishTime)
+static void replyDeliver(const char* serviceName, const char* json, uint64_t requestId, int64_t publishTime)
 {
     if ((serviceName == nullptr) || (json == nullptr) || (broker == nullptr))
         return;
@@ -693,7 +857,7 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
 // ⚠ AN ENABLER THREAD, not one of the broker's. Everything that makes the call
 // safe is on the broker's side of sampleIn; nothing may be prepared here.
 //
-void dataNotification(const char* topicName, const char* json, int64_t publishTime)
+static void dataDeliver(const char* topicName, const char* json, int64_t publishTime)
 {
     if ((topicName == nullptr) || (json == nullptr) || (broker == nullptr))
         return;
@@ -882,9 +1046,15 @@ int init(const char* configFile, const BridgeBroker* brokerP)
     // entry is how the Enabler is told so, the same convention the BridgeDriver
     // uses.
     //
+    //
+    // Before the Enabler exists: its first callback needs somewhere to queue.
+    //
+    upcallsStart();
+
     if (eprosima::ddsenabler::create_dds_enabler(configFile, callbacks, enabler) == false)
     {
         KT_E("unable to create the DDS Enabler from '%s'", configFile);
+        upcallsStop();
         return BRIDGE_ERR;
     }
 
@@ -899,10 +1069,10 @@ int init(const char* configFile, const BridgeBroker* brokerP)
 //
 // close -
 //
-// Must not return while a thread could still be inside dataNotification: the
+// Must not return while a thread could still be delivering to the broker: the
 // broker tears down what sampleIn reaches immediately afterwards. Releasing the
-// Enabler is what stops its threads, and clearing the carried set first means a
-// sample that slips through in between is dropped rather than delivered.
+// Enabler stops its threads - nothing more is queued - and stopping the
+// delivery thread, which discards what was still queued, stops the rest.
 //
 void close()
 {
@@ -913,6 +1083,7 @@ void close()
     }
 
     enabler.reset();
+    upcallsStop();
     broker = nullptr;
 }
 
