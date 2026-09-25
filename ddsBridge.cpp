@@ -1171,6 +1171,24 @@ static void goalEvent(const DdsGoal& goal, bool final, const char* subAttrName, 
 
     std::string alias = "urn:goal:" + goal.uuidText;
 
+    //
+    // ABI 5: which part of the goal the payload is - our envelope names say it,
+    // and only the plugin knows them
+    //
+    if ((broker->abiVersion >= 5) && (broker->goalEventPartIn != nullptr))
+    {
+        int part = BridgeGoalPartNone;
+
+        if      (subAttrName == nullptr)                             part = BridgeGoalPartNone;
+        else if (strcmp(subAttrName, DDS_ACTION_STATUS)   == 0)      part = BridgeGoalPartStatus;
+        else if (strcmp(subAttrName, DDS_ACTION_FEEDBACK) == 0)      part = BridgeGoalPartFeedback;
+        else if (strcmp(subAttrName, DDS_ACTION_RESULT)   == 0)      part = BridgeGoalPartResult;
+
+        broker->goalEventPartIn(bridgeAlias, goal.endpoint.c_str(), goal.token, goal.uuidText.c_str(), alias.c_str(),
+                                goal.state, final, part, subAttrName, json, publishTime);
+        return;
+    }
+
     broker->goalEventIn(bridgeAlias, goal.endpoint.c_str(), goal.token, goal.uuidText.c_str(), alias.c_str(),
                         goal.state, final, subAttrName, json, publishTime);
 }
