@@ -1110,7 +1110,11 @@ static int goalState(int statusCode, int current)
 
 // -----------------------------------------------------------------------------
 //
-// statusName - the name ddsActionStatus carries, the Enabler's own
+// statusName - the name ddsActionStatus carries, spelled as Orion-LD spells it
+//
+// lowercase camelCase ("accepted", "cancelRequestFailed") - not the Enabler's
+// enum names. A client moving from Orion-LD reads ddsActionStatus.code, and
+// until ARISE ends that contract does not change.
 //
 static const char* statusName(int statusCode)
 {
@@ -1118,17 +1122,17 @@ static const char* statusName(int statusCode)
 
     switch ((StatusCode) statusCode)
     {
-    case StatusCode::ACCEPTED:              return "ACCEPTED";
-    case StatusCode::EXECUTING:             return "EXECUTING";
-    case StatusCode::CANCELING:             return "CANCELING";
-    case StatusCode::SUCCEEDED:             return "SUCCEEDED";
-    case StatusCode::CANCELED:              return "CANCELED";
-    case StatusCode::ABORTED:               return "ABORTED";
-    case StatusCode::REJECTED:              return "REJECTED";
-    case StatusCode::TIMEOUT:               return "TIMEOUT";
-    case StatusCode::FAILED:                return "FAILED";
-    case StatusCode::CANCEL_REQUEST_FAILED: return "CANCEL_REQUEST_FAILED";
-    default:                                return "UNKNOWN";
+    case StatusCode::ACCEPTED:              return "accepted";
+    case StatusCode::EXECUTING:             return "executing";
+    case StatusCode::CANCELING:             return "canceling";
+    case StatusCode::SUCCEEDED:             return "succeeded";
+    case StatusCode::CANCELED:              return "canceled";
+    case StatusCode::ABORTED:               return "aborted";
+    case StatusCode::REJECTED:              return "rejected";
+    case StatusCode::TIMEOUT:               return "timeout";
+    case StatusCode::FAILED:                return "failed";
+    case StatusCode::CANCEL_REQUEST_FAILED: return "cancelRequestFailed";
+    default:                                return "unknown";
     }
 }
 
@@ -1284,12 +1288,12 @@ static void goalDeliver(const Upcall& upcall)
         // Refused, or unknown to the server: the goal goes on as it was, and
         // ddsActionStatus says why the cancel did not happen.
         //
-        const char* code = "CANCEL_REQUEST_FAILED";
+        const char* code = "cancelRequestFailed";
 
         if ((StatusCode) upcall.statusCode == StatusCode::CANCELED)
         {
             goal.state = BridgeGoalCanceling;
-            code       = "CANCELING";
+            code       = "canceling";
         }
 
         std::string json = statusJson(code, upcall.statusMessage);
