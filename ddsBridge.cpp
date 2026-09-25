@@ -353,7 +353,8 @@ static std::string metaBuild(const EnvelopeInfo& info, bool cutParticipant, uint
 // never will. When Service Execution lands, what changes is this line and the
 // translation around it - not the broker, and not the model.
 //
-#define DDS_SERVICE_REPLY  "reply"                  // Orion-LD's name for it - its clients read it
+#define DDS_SERVICE_REPLY    "reply"                // Orion-LD's name for it - its clients read it
+#define DDS_SERVICE_REQUEST  "request"              // ... and for the request it answers, beside it (ABI 7)
 
 
 
@@ -463,10 +464,21 @@ bool serviceQuery(const char* serviceName, eprosima::ddsenabler::participants::S
 // no more, and it is worth having as one: "the peer is there" is the first
 // thing anybody asks when a request goes unanswered.
 //
+static std::map<std::string, std::string>  discoveredRequestType;   // service -> its request's type, as discovered (serviceMutex)
+
 void serviceNotification(const char* serviceName, const eprosima::ddsenabler::participants::ServiceInfo& serviceInfo)
 {
     if (serviceName == nullptr)
         return;
+
+    //
+    // The one thing kept: the request's type name as the domain announces it -
+    // what Orion-LD shows as the request's ddsDataType.
+    //
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+        discoveredRequestType[serviceName] = serviceInfo.request.type_name;
+    }
 
     KT_T(0, "dds: service '%s' discovered (request '%s', reply '%s')",
          serviceName, serviceInfo.request.type_name.c_str(), serviceInfo.reply.type_name.c_str());
@@ -737,6 +749,84 @@ static const std::chrono::minutes              TRACKED_KEEP(10);
 
 // -----------------------------------------------------------------------------
 //
+// Sent requests - what was asked, by request id, for the reply to carry (ABI 7)
+//
+// Orion-LD shows a service call as "request" beside "reply": what was sent, its
+// request id, its data type and when. The Enabler hands a reply back with the
+// request id and nothing of the request, so it is kept here, for EVERY request
+// - tracked or not - under trackedMutex, and taken when the reply comes.
+// Forgotten after TRACKED_KEEP, as a tracked one is.
+//
+struct SentRequest
+{
+    std::string                            json;
+    std::string                            requestType;
+    int64_t                                sentNs;         // wall clock, nanoseconds since the epoch
+    std::chrono::steady_clock::time_point  sentAt;
+};
+
+static std::map<uint64_t, SentRequest>         sentRequests;
+
+
+
+// -----------------------------------------------------------------------------
+//
+// sentRemember - a request was sent. Caller holds trackedMutex.
+//
+static void sentRemember(uint64_t requestId, const char* endpoint, const char* json, std::chrono::steady_clock::time_point now)
+{
+    for (auto it = sentRequests.begin(); it != sentRequests.end(); )
+    {
+        if (now - it->second.sentAt > TRACKED_KEEP)
+            it = sentRequests.erase(it);
+        else
+            ++it;
+    }
+
+    SentRequest sent;
+
+    sent.json   = json;
+    sent.sentAt = now;
+    sent.sentNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+        auto dIt = discoveredRequestType.find(endpoint);
+        auto cIt = serviceConfig.find(endpoint);
+
+        if ((dIt != discoveredRequestType.end()) && (dIt->second.empty() == false))
+            sent.requestType = dIt->second;
+        else if (cIt != serviceConfig.end())
+            sent.requestType = cIt->second.request;
+    }
+
+    sentRequests[requestId] = std::move(sent);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// sentTake - what was asked, for this reply; false if it is not known
+//
+static bool sentTake(uint64_t requestId, SentRequest& out)
+{
+    std::lock_guard<std::recursive_mutex> guard(trackedMutex);
+    auto it = sentRequests.find(requestId);
+
+    if (it == sentRequests.end())
+        return false;
+
+    out = std::move(it->second);
+    sentRequests.erase(it);
+
+    return true;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // trackedTake - the token a reply must carry back, 0 if it was not tracked
 //
 static uint64_t trackedTake(uint64_t requestId)
@@ -801,9 +891,28 @@ static void replyDeliver(const char* serviceName, const char* json, uint64_t req
     // ABI 6: what the envelope said about the reply, and which request it
     // answers - as Orion-LD shows them on its reply sub-attribute
     //
+    std::string meta = metaBuild(info, false, requestId, 0);
+    SentRequest sent;
+
+    //
+    // ABI 7: the request it answers goes along - "request" beside "reply", in
+    // one write, as Orion-LD shows a service call
+    //
+    if ((broker->abiVersion >= 7) && (broker->replyExchangeIn != nullptr) && (sentTake(requestId, sent) == true))
+    {
+        EnvelopeInfo requestInfo;
+        requestInfo.dataType = sent.requestType;
+
+        std::string requestMeta = metaBuild(requestInfo, false, requestId, 0);
+
+        broker->replyExchangeIn(bridgeAlias, serviceName, token, nullptr,
+                                DDS_SERVICE_REQUEST, sent.json.c_str(), requestMeta.c_str(), sent.sentNs,
+                                DDS_SERVICE_REPLY, answer, meta.c_str(), publishTime);
+        return;
+    }
+
     if ((broker->abiVersion >= 6) && (broker->replyMetaIn != nullptr))
     {
-        std::string meta = metaBuild(info, false, requestId, 0);
         broker->replyMetaIn(bridgeAlias, serviceName, token, nullptr, DDS_SERVICE_REPLY, answer, meta.c_str(), publishTime);
         return;
     }
@@ -1909,7 +2018,12 @@ int serviceInvoke(const char* endpoint, const char* json)
     if (enabler == nullptr)
         return BRIDGE_ERR;
 
-    uint64_t requestId = 0;
+    //
+    // Under trackedMutex across the send, as serviceInvokeTracked: the reply may
+    // be delivered before this thread writes the request down (see Sent requests)
+    //
+    std::lock_guard<std::recursive_mutex> guard(trackedMutex);
+    uint64_t                              requestId = 0;
 
     if (enabler->send_service_request(endpoint, json, requestId) == false)
     {
@@ -1922,6 +2036,8 @@ int serviceInvoke(const char* endpoint, const char* json)
              endpoint, json);
         return BRIDGE_ERR;
     }
+
+    sentRemember(requestId, endpoint, json, std::chrono::steady_clock::now());
 
     KT_T(0, "dds: request %llu sent to service '%s'", (unsigned long long) requestId, endpoint);
 
@@ -1971,6 +2087,7 @@ int serviceInvokeTracked(const char* endpoint, const char* json, uint64_t token)
     }
 
     trackedRequests[requestId] = TrackedRequest{ token, now };
+    sentRemember(requestId, endpoint, json, now);
 
     KT_T(0, "dds: request %llu sent to service '%s', waited for (token %llu)",
          (unsigned long long) requestId, endpoint, (unsigned long long) token);
