@@ -322,7 +322,18 @@ bool topicQuery(const char* topicName, eprosima::ddsenabler::participants::Topic
 // Defined below, with the rest of the sample handling - a reply arrives inside
 // the same envelope a sample does, so it comes off in the same place.
 //
-static bool sampleUnwrap(const char* topicName, const char* json, std::string& payload);
+//
+// EnvelopeInfo - what the envelope says ABOUT a sample: the meta object (ABI 6)
+//
+struct EnvelopeInfo
+{
+    std::string  participantId;                        // the envelope's top-level "id"
+    std::string  dataType;                             // the topic member's "type"
+    std::string  instanceHandle;                       // the key of the one sample under "data"
+};
+
+static bool        sampleUnwrap(const char* topicName, const char* json, std::string& payload, EnvelopeInfo* infoP = nullptr);
+static std::string metaBuild(const EnvelopeInfo& info, bool cutParticipant, uint64_t requestId, int64_t publishedAtNs);
 
 
 
@@ -342,7 +353,7 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
 // never will. When Service Execution lands, what changes is this line and the
 // translation around it - not the broker, and not the model.
 //
-#define DDS_SERVICE_REPLY  "ddsServiceReply"
+#define DDS_SERVICE_REPLY  "reply"                  // Orion-LD's name for it - its clients read it
 
 
 
@@ -780,9 +791,22 @@ static void replyDeliver(const char* serviceName, const char* json, uint64_t req
     // so it is unwrapped in the same place. Only what the server answered
     // crosses the seam.
     //
-    std::string payload;
-    const char* answer = (sampleUnwrap(nullptr, json, payload) == true) ? payload.c_str() : json;
-    uint64_t    token  = trackedTake(requestId);
+    std::string  payload;
+    EnvelopeInfo info;
+    bool         unwrapped = sampleUnwrap(nullptr, json, payload, &info);
+    const char*  answer    = (unwrapped == true) ? payload.c_str() : json;
+    uint64_t     token     = trackedTake(requestId);
+
+    //
+    // ABI 6: what the envelope said about the reply, and which request it
+    // answers - as Orion-LD shows them on its reply sub-attribute
+    //
+    if ((broker->abiVersion >= 6) && (broker->replyMetaIn != nullptr))
+    {
+        std::string meta = metaBuild(info, false, requestId, 0);
+        broker->replyMetaIn(bridgeAlias, serviceName, token, nullptr, DDS_SERVICE_REPLY, answer, meta.c_str(), publishTime);
+        return;
+    }
 
     //
     // ABI 3 AND a non-NULL slot: a host that is not the broker (ftClient) is
@@ -881,7 +905,7 @@ void serviceRequestNotification(const char* serviceName, const char* json, uint6
 // keyed by a name other than the one it was delivered under used to fall
 // through unwrapped, and the whole envelope became the value.
 //
-static bool sampleUnwrap(const char* topicName, const char* json, std::string& payload)
+static bool sampleUnwrap(const char* topicName, const char* json, std::string& payload, EnvelopeInfo* infoP)
 {
     //
     // kjParse works IN the buffer it is given, so the Enabler's string is
@@ -921,6 +945,21 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
     if (sampleP != nullptr)
     {
         //
+        // What the envelope says ABOUT the sample - for the meta object (ABI 6),
+        // which is how Orion-LD's clients see it: instanceHandleId,
+        // participantId, ddsDataType
+        //
+        if (infoP != nullptr)
+        {
+            KjNode* idP   = kjLookup(treeP,  "id");
+            KjNode* typeP = kjLookup(topicP, "type");
+
+            if ((idP   != nullptr) && (idP->type   == KjString))  infoP->participantId  = idP->value.s;
+            if ((typeP != nullptr) && (typeP->type == KjString))  infoP->dataType       = typeP->value.s;
+            if (sampleP->name != nullptr)                         infoP->instanceHandle = sampleP->name;
+        }
+
+        //
         // The instance handle is the member's NAME, and a rendered member is
         // "name":value - so the name goes before the render, not after it.
         //
@@ -935,6 +974,85 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
     kaBufferReset(&kalloc, KTRUE);
 
     return unwrapped;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// jsonStringAppend - "name":"value", escaped, to a meta object being built
+//
+static void jsonStringAppend(std::string& out, const char* name, const std::string& value)
+{
+    if (out.size() > 1)
+        out += ',';
+
+    out += '"';
+    out += name;
+    out += "\":\"";
+
+    for (char c : value)
+    {
+        if ((c == '"') || (c == '\\'))
+            out += '\\';
+
+        if ((unsigned char) c >= 0x20)
+            out += c;
+    }
+
+    out += '"';
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// metaBuild - what the envelope said about a payload, as the meta object (ABI 6)
+//
+// Named as Orion-LD names them, which is what its DDS clients read:
+// instanceHandleId, participantId, ddsDataType - and requestId for a reply,
+// publishedAt for a topic sample (Orion-LD puts the transport's raw
+// nanoseconds there for a sample; a reply's and a goal's publishedAt is the
+// broker's, in seconds). The broker makes each a Property sub-attribute and
+// does not know what any of them means.
+//
+// @param cutParticipant  a topic sample's participant id is cut at its first
+//                        '|' - Orion-LD does so for samples and not for replies
+//
+static std::string metaBuild(const EnvelopeInfo& info, bool cutParticipant, uint64_t requestId, int64_t publishedAtNs)
+{
+    std::string out = "{";
+
+    if (requestId != 0)
+        out += "\"requestId\":" + std::to_string(requestId);
+
+    if (info.instanceHandle.empty() == false)
+        jsonStringAppend(out, "instanceHandleId", info.instanceHandle);
+
+    if (info.participantId.empty() == false)
+    {
+        std::string participant = info.participantId;
+
+        if (cutParticipant == true)
+            participant = participant.substr(0, participant.find('|'));
+
+        jsonStringAppend(out, "participantId", participant);
+    }
+
+    if (info.dataType.empty() == false)
+        jsonStringAppend(out, "ddsDataType", info.dataType);
+
+    if (publishedAtNs > 0)
+    {
+        if (out.size() > 1)
+            out += ',';
+
+        out += "\"publishedAt\":" + std::to_string(publishedAtNs);
+    }
+
+    out += '}';
+
+    return out;
 }
 
 
@@ -972,13 +1090,19 @@ static void dataDeliver(const char* topicName, const char* json, int64_t publish
     // Only what the publisher wrote crosses the seam, not the Enabler's
     // envelope around it.
     //
-    std::string payload;
-    int         r;
+    std::string  payload;
+    EnvelopeInfo info;
+    int          r;
 
-    if (sampleUnwrap(topicName, json, payload) == true)
-        r = broker->sampleIn(bridgeAlias, topicName, payload.c_str(), publishTime);
-    else
+    if (sampleUnwrap(topicName, json, payload, &info) == false)
         r = broker->sampleIn(bridgeAlias, topicName, json, publishTime);
+    else if ((broker->abiVersion >= 6) && (broker->sampleMetaIn != nullptr))
+    {
+        std::string meta = metaBuild(info, true, 0, publishTime);
+        r = broker->sampleMetaIn(bridgeAlias, topicName, payload.c_str(), meta.c_str(), publishTime);
+    }
+    else
+        r = broker->sampleIn(bridgeAlias, topicName, payload.c_str(), publishTime);
 
     if ((claimed == false) && (r == BRIDGE_NOT_FOUND))
     {
@@ -1168,7 +1292,7 @@ static std::string statusJson(const char* code, const std::string& message)
 //
 // goalEvent - hand one event of a goal to the broker. Caller holds goalMutex.
 //
-static void goalEvent(const DdsGoal& goal, bool final, const char* subAttrName, const char* json, int64_t publishTime)
+static void goalEvent(const DdsGoal& goal, bool final, const char* subAttrName, const char* json, int64_t publishTime, const char* meta = nullptr)
 {
     if ((broker == nullptr) || (broker->abiVersion < 4) || (broker->goalEventIn == nullptr))
         return;
@@ -1187,6 +1311,16 @@ static void goalEvent(const DdsGoal& goal, bool final, const char* subAttrName, 
         else if (strcmp(subAttrName, DDS_ACTION_STATUS)   == 0)      part = BridgeGoalPartStatus;
         else if (strcmp(subAttrName, DDS_ACTION_FEEDBACK) == 0)      part = BridgeGoalPartFeedback;
         else if (strcmp(subAttrName, DDS_ACTION_RESULT)   == 0)      part = BridgeGoalPartResult;
+
+        //
+        // ABI 6: and what the envelope said about it
+        //
+        if ((meta != nullptr) && (broker->abiVersion >= 6) && (broker->goalEventMetaIn != nullptr))
+        {
+            broker->goalEventMetaIn(bridgeAlias, goal.endpoint.c_str(), goal.token, goal.uuidText.c_str(), alias.c_str(),
+                                    goal.state, final, part, subAttrName, json, meta, publishTime);
+            return;
+        }
 
         broker->goalEventPartIn(bridgeAlias, goal.endpoint.c_str(), goal.token, goal.uuidText.c_str(), alias.c_str(),
                                 goal.state, final, part, subAttrName, json, publishTime);
@@ -1253,10 +1387,31 @@ static void goalDeliver(const Upcall& upcall)
 
     DdsGoal& goal = it->second;
 
+    //
+    // Feedback and a result come in the Enabler's envelope, as a reply does -
+    // unwrapped the same way, and what the envelope said goes along as meta.
+    // Not an envelope: passed on as it came, with no meta.
+    //
+    std::string  payload;
+    EnvelopeInfo info;
+    std::string  meta;
+    bool         unwrapped = false;
+
+    if ((upcall.kind == UpcallGoalFeedback) || (upcall.kind == UpcallGoalResult))
+    {
+        unwrapped = sampleUnwrap(nullptr, upcall.json.c_str(), payload, &info);
+
+        if (unwrapped == true)
+            meta = metaBuild(info, false, 0, 0);
+    }
+
+    const char* body     = (unwrapped == true) ? payload.c_str() : upcall.json.c_str();
+    const char* metaText = (unwrapped == true) ? meta.c_str()    : nullptr;
+
     if (upcall.kind == UpcallGoalFeedback)
     {
         goal.state = BridgeGoalExecuting;
-        goalEvent(goal, false, DDS_ACTION_FEEDBACK, upcall.json.c_str(), upcall.publishTime);
+        goalEvent(goal, false, DDS_ACTION_FEEDBACK, body, upcall.publishTime, metaText);
         return;
     }
 
@@ -1268,7 +1423,7 @@ static void goalDeliver(const Upcall& upcall)
         // The later of the two ends the goal. The terminal status that came
         // first already set the state this event carries.
         //
-        goalEvent(goal, goal.terminalSeen, DDS_ACTION_RESULT, upcall.json.c_str(), upcall.publishTime);
+        goalEvent(goal, goal.terminalSeen, DDS_ACTION_RESULT, body, upcall.publishTime, metaText);
 
         if (goal.terminalSeen == true)
             goalForget(text);
