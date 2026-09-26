@@ -2109,7 +2109,35 @@ int publish(const char* endpoint, const char* json)
     //
     // std::string, right here, is the reason this file is C++.
     //
-    return (enabler->publish(endpoint, json) == true) ? BRIDGE_OK : BRIDGE_ERR;
+    if (enabler->publish(endpoint, json) == true)
+        return BRIDGE_OK;
+
+    //
+    // The Enabler's false is bare, and the broker answers the client with what
+    // this says (it publishes BEFORE it stores - DDS first): 400 for a value
+    // that does not fit, 503 for a sample that cannot be sent.
+    //
+    // A topic nobody has announced cannot be serialized for at all (topicQuery),
+    // so that is the transport's problem. For an announced one, the Enabler's
+    // one ordinary refusal is the JSON not fitting the type - writer creation
+    // and the payload pool fail only when something is badly wrong, and are
+    // reported as the client's value then too.
+    //
+    bool known;
+
+    {
+        std::lock_guard<std::mutex> guard(discoveryMutex);
+        known = (topicStore.find(endpoint) != topicStore.end());
+    }
+
+    if (known == true)
+    {
+        KT_W("dds: '%s' refused on topic '%s' - it does not fit the topic's type", json, endpoint);
+        return BRIDGE_BAD_INPUT;
+    }
+
+    KT_W("dds: cannot publish on topic '%s' - it has not been announced on this domain", endpoint);
+    return BRIDGE_ERR;
 }
 
 
