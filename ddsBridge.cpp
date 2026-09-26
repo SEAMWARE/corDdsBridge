@@ -402,6 +402,16 @@ std::map<std::string, std::string>   actionConfig;     // endpoint -> action typ
 std::mutex                           serviceMutex;
 
 //
+// Services and actions the configuration does not name, as discovered (ABI 8):
+// their types, so that serviceQuery / actionQuery can answer for them once the
+// broker carries them (endpointDiscoveredIn -> channelAdd). serviceMutex.
+//
+static std::map<std::string, ServiceTypes>  discoveredService;
+static std::map<std::string, std::string>   discoveredAction;           // action -> its type (the goal request's, minus _SendGoal_Request_)
+
+static void upcallDiscoveredQueueAdd(const char* endpoint, BridgeChannelKind kind);
+
+//
 // Which services this process ANSWERS, and who answers them.
 //
 // ⛔ Empty in the broker, always. The broker is a client and has nothing to
@@ -442,8 +452,13 @@ bool serviceQuery(const char* serviceName, eprosima::ddsenabler::participants::S
 
     if (it == serviceConfig.end())
     {
-        KT_T(0, "dds: service '%s' is not in the configuration - its types are unknown", serviceName);
-        return false;
+        it = discoveredService.find(serviceName);            // not configured, but discovered (ABI 8)
+
+        if (it == discoveredService.end())
+        {
+            KT_T(0, "dds: service '%s' is neither configured nor discovered - its types are unknown", serviceName);
+            return false;
+        }
     }
 
     serviceInfo.request = eprosima::ddsenabler::participants::TopicInfo(it->second.request, SERVICE_QOS);
@@ -475,13 +490,26 @@ void serviceNotification(const char* serviceName, const eprosima::ddsenabler::pa
     // The one thing kept: the request's type name as the domain announces it -
     // what Orion-LD shows as the request's ddsDataType.
     //
+    bool unconfigured;
+
     {
         std::lock_guard<std::mutex> guard(serviceMutex);
         discoveredRequestType[serviceName] = serviceInfo.request.type_name;
+
+        unconfigured = (serviceConfig.find(serviceName) == serviceConfig.end());
+        if (unconfigured == true)
+            discoveredService[serviceName] = { serviceInfo.request.type_name, serviceInfo.reply.type_name };
     }
 
     KT_T(0, "dds: service '%s' discovered (request '%s', reply '%s')",
          serviceName, serviceInfo.request.type_name.c_str(), serviceInfo.reply.type_name.c_str());
+
+    //
+    // Not configured: the broker may carry it (ABI 8). Queued - this is an
+    // Enabler callback, inside its lock, and the broker calls channelAdd back.
+    //
+    if (unconfigured == true)
+        upcallDiscoveredQueueAdd(serviceName, BridgeChannelService);
 }
 
 
@@ -513,7 +541,8 @@ enum UpcallKind
     UpcallReply,
     UpcallGoalFeedback,
     UpcallGoalStatus,
-    UpcallGoalResult
+    UpcallGoalResult,
+    UpcallDiscovered                                   // a service or an action nobody configured (ABI 8)
 };
 
 struct Upcall
@@ -528,6 +557,9 @@ struct Upcall
     eprosima::ddsenabler::participants::UUID  goalUuid;
     int                                       statusCode;
     std::string                               statusMessage;
+
+    // UpcallDiscovered only
+    BridgeChannelKind                         channelKind;
 };
 
 static const size_t              UPCALL_QUEUE_MAX = 10000;
@@ -541,6 +573,7 @@ static bool                      upcallRunning = false;
 static void dataDeliver(const char* topicName, const char* json, int64_t publishTime);
 static void replyDeliver(const char* serviceName, const char* json, uint64_t requestId, int64_t publishTime);
 static void goalDeliver(const Upcall& upcall);
+static void discoveredDeliver(const char* endpoint, BridgeChannelKind kind);
 static void goalSweep();
 
 
@@ -569,6 +602,58 @@ static void upcallQueueAdd(UpcallKind kind, const char* endpoint, const char* js
 
     upcallQueue.push_back(std::move(upcall));
     upcallReady.notify_one();
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// upcallDiscoveredQueueAdd - a service or action nobody configured, on an ENABLER thread: queue, return
+//
+static void upcallDiscoveredQueueAdd(const char* endpoint, BridgeChannelKind kind)
+{
+    std::unique_lock<std::mutex> lock(upcallMutex);
+
+    upcallRoom.wait(lock, [] { return (upcallRunning == false) || (upcallQueue.size() < UPCALL_QUEUE_MAX); });
+
+    if (upcallRunning == false)
+        return;
+
+    Upcall upcall;
+
+    upcall.kind        = UpcallDiscovered;
+    upcall.endpoint    = endpoint;
+    upcall.requestId   = 0;
+    upcall.publishTime = 0;
+    upcall.statusCode  = 0;
+    upcall.channelKind = kind;
+
+    upcallQueue.push_back(std::move(upcall));
+    upcallReady.notify_one();
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// discoveredDeliver - tell the broker, on the upcall thread (ABI 8)
+//
+// The broker may carry it: a Channel on its catch-all, handed back to this
+// plugin through channelAdd() before the call returns - which is why this runs
+// here, holding none of the Enabler's locks.
+//
+static void discoveredDeliver(const char* endpoint, BridgeChannelKind kind)
+{
+    if ((endpoint == nullptr) || (broker == nullptr))
+        return;
+
+    if ((broker->abiVersion < 8) || (broker->endpointDiscoveredIn == nullptr))
+    {
+        KT_T(0, "dds: '%s' discovered - the host predates ABI 8, not reported", endpoint);
+        return;
+    }
+
+    broker->endpointDiscoveredIn(bridgeAlias, endpoint, (int) kind);
 }
 
 
@@ -648,6 +733,8 @@ static void upcallLoop()
             dataDeliver(upcall.endpoint.c_str(), upcall.json.c_str(), upcall.publishTime);
         else if (upcall.kind == UpcallReply)
             replyDeliver(upcall.endpoint.c_str(), upcall.json.c_str(), upcall.requestId, upcall.publishTime);
+        else if (upcall.kind == UpcallDiscovered)
+            discoveredDeliver(upcall.endpoint.c_str(), upcall.channelKind);
         else
             goalDeliver(upcall);
     }
@@ -1675,6 +1762,32 @@ void actionNotification(const char* actionName, const eprosima::ddsenabler::part
         return;
 
     KT_T(0, "dds: action '%s' discovered (goal '%s')", actionName, actionInfo.goal.request.type_name.c_str());
+
+    //
+    // The action's own type is its goal request's minus the suffix every
+    // action's has - the inverse of what actionQuery derives from it.
+    //
+    static const std::string  suffix = "_SendGoal_Request_";
+    const std::string&        goalType = actionInfo.goal.request.type_name;
+
+    if ((goalType.size() <= suffix.size()) || (goalType.compare(goalType.size() - suffix.size(), suffix.size(), suffix) != 0))
+    {
+        KT_T(0, "dds: action '%s': goal type '%s' is not <type>%s - not reported", actionName, goalType.c_str(), suffix.c_str());
+        return;
+    }
+
+    bool unconfigured;
+
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+
+        unconfigured = (actionConfig.find(actionName) == actionConfig.end());
+        if (unconfigured == true)
+            discoveredAction[actionName] = goalType.substr(0, goalType.size() - suffix.size());
+    }
+
+    if (unconfigured == true)
+        upcallDiscoveredQueueAdd(actionName, BridgeChannelAction);    // see serviceNotification
 }
 
 
@@ -1701,8 +1814,13 @@ bool actionQuery(const char* actionName, eprosima::ddsenabler::participants::Act
 
         if (it == actionConfig.end())
         {
-            KT_T(0, "dds: action '%s' is not in the configuration - its types are unknown", actionName);
-            return false;
+            it = discoveredAction.find(actionName);           // not configured, but discovered (ABI 8)
+
+            if (it == discoveredAction.end())
+            {
+                KT_T(0, "dds: action '%s' is neither configured nor discovered - its types are unknown", actionName);
+                return false;
+            }
         }
 
         type = it->second;
