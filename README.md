@@ -80,7 +80,7 @@ list this repo appears in:
 | `ON` | build; a missing dependency is an error |
 | `OFF` | do not build |
 
-Nothing of the broker's is linked: `ktrace` and the rest resolve from the
+Nothing of the broker's is linked: `corLog` and the rest resolve from the
 running process, which is linked `rdynamic`.
 
 ## State
