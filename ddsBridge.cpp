@@ -40,9 +40,9 @@ extern "C"
 #include "corTree/corTreeLookup.h"                     // corTreeLookup
 #include "corJson/corJsonRender.h"                     // corJsonFastRender
 #include "corJson/corJsonRenderSize.h"                 // corJsonFastRenderSize
-#include "kalloc/KAlloc.h"                             // KAlloc
-#include "kalloc/kaBufferInit.h"                       // kaBufferInit
-#include "kalloc/kaBufferReset.h"                      // kaBufferReset
+#include "corAlloc/CorAlloc.h"                         // CorAlloc
+#include "corAlloc/corAllocBufferInit.h"               // corAllocBufferInit
+#include "corAlloc/corAllocBufferReset.h"              // corAllocBufferReset
 }
 
 #include "ddsBridge.hpp"                               // Own interface
@@ -1109,11 +1109,11 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
     //
     std::string  copy(json);
     char         kallocBuffer[8192];
-    KAlloc       kalloc;
+    CorAlloc     kalloc;
     CorJson      corJson;
     bool         unwrapped = false;
 
-    kaBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsSample");
+    corAllocBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsSample");
 
     CorJson* corJsonP = corJsonCreate(&corJson, &kalloc);
     CorNode* treeP = corJsonParse(corJsonP, (char*) copy.c_str());
@@ -1167,7 +1167,7 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
         unwrapped = true;
     }
 
-    kaBufferReset(&kalloc, KTRUE);
+    corAllocBufferReset(&kalloc, true);
 
     return unwrapped;
 }
@@ -1883,11 +1883,11 @@ int init(const char* configFile, const BridgeBroker* brokerP)
 
             if ((size > 0) && (fread(buf.data(), 1, (size_t) size, fP) == (size_t) size))
             {
-            char    kallocBuffer[8192];
-            KAlloc  kalloc;
-            CorJson corJson;
+            char      kallocBuffer[8192];
+            CorAlloc  kalloc;
+            CorJson   corJson;
 
-            kaBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsTypes");
+            corAllocBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsTypes");
 
             CorJson* corJsonP = corJsonCreate(&corJson, &kalloc);
             CorNode* treeP = corJsonParse(corJsonP, buf.data());
@@ -1963,7 +1963,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
                 }
             }
 
-            kaBufferReset(&kalloc, KTRUE);
+            corAllocBufferReset(&kalloc, true);
             }
             fclose(fP);
         }
