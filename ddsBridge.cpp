@@ -34,12 +34,12 @@
 extern "C"
 {
 #include "ktrace/kTrace.h"                             // KT_I, KT_W, KT_E, KT_T
-#include "kjson/kjson.h"                               // Kjson
-#include "kjson/kjBufferCreate.h"                      // kjBufferCreate
-#include "kjson/kjParse.h"                             // kjParse
-#include "kjson/kjLookup.h"                            // kjLookup
-#include "kjson/kjRender.h"                            // kjFastRender
-#include "kjson/kjRenderSize.h"                        // kjFastRenderSize
+#include "corJson/CorJson.h"                           // CorJson
+#include "corJson/corJsonCreate.h"                     // corJsonCreate
+#include "corJson/corJsonParse.h"                      // corJsonParse
+#include "corTree/corTreeLookup.h"                     // corTreeLookup
+#include "corJson/corJsonRender.h"                     // corJsonFastRender
+#include "corJson/corJsonRenderSize.h"                 // corJsonFastRenderSize
 #include "kalloc/KAlloc.h"                             // KAlloc
 #include "kalloc/kaBufferInit.h"                       // kaBufferInit
 #include "kalloc/kaBufferReset.h"                      // kaBufferReset
@@ -1104,30 +1104,30 @@ void serviceRequestNotification(const char* serviceName, const char* json, uint6
 static bool sampleUnwrap(const char* topicName, const char* json, std::string& payload, EnvelopeInfo* infoP)
 {
     //
-    // kjParse works IN the buffer it is given, so the Enabler's string is
+    // corJsonParse works IN the buffer it is given, so the Enabler's string is
     // copied first - it belongs to the Enabler and is const.
     //
     std::string  copy(json);
     char         kallocBuffer[8192];
     KAlloc       kalloc;
-    Kjson        kjson;
+    CorJson      corJson;
     bool         unwrapped = false;
 
     kaBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsSample");
 
-    Kjson*  kjP    = kjBufferCreate(&kjson, &kalloc);
-    KjNode* treeP  = kjParse(kjP, (char*) copy.c_str());
-    KjNode* topicP = ((treeP != nullptr) && (treeP->type == KjObject) && (topicName != nullptr)) ? kjLookup(treeP, topicName) : nullptr;
+    CorJson* corJsonP = corJsonCreate(&corJson, &kalloc);
+    CorNode* treeP = corJsonParse(corJsonP, (char*) copy.c_str());
+    CorNode* topicP = ((treeP != nullptr) && (treeP->type == CorObject) && (topicName != nullptr)) ? corTreeLookup(treeP, topicName) : nullptr;
 
     //
     // Not keyed by the name we expected, or we had no name to expect: the one
     // member that is an object carrying 'data' is the message.
     //
-    if ((topicP == nullptr) && (treeP != nullptr) && (treeP->type == KjObject))
+    if ((topicP == nullptr) && (treeP != nullptr) && (treeP->type == CorObject))
     {
-        for (KjNode* childP = treeP->value.firstChildP; childP != nullptr; childP = childP->next)
+        for (CorNode* childP = treeP->value.firstChildP; childP != nullptr; childP = childP->next)
         {
-            if ((childP->type == KjObject) && (kjLookup(childP, "data") != nullptr))
+            if ((childP->type == CorObject) && (corTreeLookup(childP, "data") != nullptr))
             {
                 topicP = childP;
                 break;
@@ -1135,8 +1135,8 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
         }
     }
 
-    KjNode* dataP  = ((topicP != nullptr) && (topicP->type == KjObject)) ? kjLookup(topicP, "data")   : nullptr;
-    KjNode* sampleP = ((dataP != nullptr) && (dataP->type == KjObject))  ? dataP->value.firstChildP   : nullptr;
+    CorNode* dataP = ((topicP != nullptr) && (topicP->type == CorObject)) ? corTreeLookup(topicP, "data") : nullptr;
+    CorNode* sampleP = ((dataP != nullptr) && (dataP->type == CorObject)) ? dataP->value.firstChildP  : nullptr;
 
     if (sampleP != nullptr)
     {
@@ -1147,11 +1147,11 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
         //
         if (infoP != nullptr)
         {
-            KjNode* idP   = kjLookup(treeP,  "id");
-            KjNode* typeP = kjLookup(topicP, "type");
+            CorNode* idP  = corTreeLookup(treeP, "id");
+            CorNode* typeP = corTreeLookup(topicP, "type");
 
-            if ((idP   != nullptr) && (idP->type   == KjString))  infoP->participantId  = idP->value.s;
-            if ((typeP != nullptr) && (typeP->type == KjString))  infoP->dataType       = typeP->value.s;
+            if ((idP   != nullptr) && (idP->type   == CorString)) infoP->participantId  = idP->value.s;
+            if ((typeP != nullptr) && (typeP->type == CorString)) infoP->dataType       = typeP->value.s;
             if (sampleP->name != nullptr)                         infoP->instanceHandle = sampleP->name;
         }
 
@@ -1161,8 +1161,8 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
         //
         sampleP->name = (char*) "";
 
-        payload.resize(kjFastRenderSize(sampleP));
-        kjFastRender(sampleP, (char*) payload.data());
+        payload.resize(corJsonFastRenderSize(sampleP));
+        corJsonFastRender(sampleP, (char*) payload.data());
         payload.resize(strlen(payload.c_str()));
         unwrapped = true;
     }
@@ -1861,7 +1861,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
 
     //
     // dds.ngsild.typesDirectory, if the file names one. Read with the host's
-    // own kjson - a plugin resolves the broker's symbols at dlopen, so there is
+    // own corJson - a plugin resolves the broker's symbols at dlopen, so there is
     // no JSON library to link here and no second parser to keep in step.
     //
     {
@@ -1885,17 +1885,17 @@ int init(const char* configFile, const BridgeBroker* brokerP)
             {
             char    kallocBuffer[8192];
             KAlloc  kalloc;
-            Kjson   kjson;
+            CorJson corJson;
 
             kaBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsTypes");
 
-            Kjson*  kjP   = kjBufferCreate(&kjson, &kalloc);
-            KjNode* treeP = kjParse(kjP, buf.data());
-            KjNode* ddsP  = (treeP  != nullptr) ? kjLookup(treeP, "dds")     : nullptr;
-            KjNode* ngP   = (ddsP   != nullptr) ? kjLookup(ddsP, "ngsild")   : nullptr;
-            KjNode* dirP  = (ngP    != nullptr) ? kjLookup(ngP, "typesDirectory") : nullptr;
+            CorJson* corJsonP = corJsonCreate(&corJson, &kalloc);
+            CorNode* treeP = corJsonParse(corJsonP, buf.data());
+            CorNode* ddsP = (treeP  != nullptr) ? corTreeLookup(treeP, "dds") : nullptr;
+            CorNode* ngP  = (ddsP   != nullptr) ? corTreeLookup(ddsP, "ngsild") : nullptr;
+            CorNode* dirP = (ngP    != nullptr) ? corTreeLookup(ngP, "typesDirectory") : nullptr;
 
-            if ((dirP != nullptr) && (dirP->type == KjString) && (dirP->value.s != nullptr))
+            if ((dirP != nullptr) && (dirP->type == CorString) && (dirP->value.s != nullptr))
             {
                 typesDirectory = dirP->value.s;
                 KT_I("dds: types are kept in '%s'", typesDirectory.c_str());
@@ -1910,23 +1910,23 @@ int init(const char* configFile, const BridgeBroker* brokerP)
             // is this plugin's. Neither side parses the other's half, and the
             // deployment describes one service in one place.
             //
-            KjNode* servicesP = (ngP != nullptr) ? kjLookup(ngP, "services") : nullptr;
+            CorNode* servicesP = (ngP != nullptr) ? corTreeLookup(ngP, "services") : nullptr;
 
             if (servicesP != nullptr)
             {
                 std::lock_guard<std::mutex> guard(serviceMutex);
 
-                for (KjNode* entryP = servicesP->value.firstChildP; entryP != nullptr; entryP = entryP->next)
+                for (CorNode* entryP = servicesP->value.firstChildP; entryP != nullptr; entryP = entryP->next)
                 {
-                    if ((entryP->name == nullptr) || (entryP->type != KjObject))
+                    if ((entryP->name == nullptr) || (entryP->type != CorObject))
                         continue;
 
-                    KjNode*      reqP = kjLookup(entryP, "requestType");
-                    KjNode*      repP = kjLookup(entryP, "replyType");
+                    CorNode*     reqP = corTreeLookup(entryP, "requestType");
+                    CorNode*     repP = corTreeLookup(entryP, "replyType");
                     ServiceTypes types;
 
-                    types.request = ((reqP != nullptr) && (reqP->type == KjString)) ? reqP->value.s : std::string(entryP->name) + "_Request";
-                    types.reply   = ((repP != nullptr) && (repP->type == KjString)) ? repP->value.s : std::string(entryP->name) + "_Response";
+                    types.request = ((reqP != nullptr) && (reqP->type == CorString)) ? reqP->value.s : std::string(entryP->name) + "_Request";
+                    types.reply   = ((repP != nullptr) && (repP->type == CorString)) ? repP->value.s : std::string(entryP->name) + "_Response";
 
                     serviceConfig[entryP->name] = types;
 
@@ -1939,20 +1939,20 @@ int init(const char* configFile, const BridgeBroker* brokerP)
             // plugin reads "type" - the ROS 2 action type every one of the
             // action's DDS types is derived from (see actionQuery).
             //
-            KjNode* actionsP = (ngP != nullptr) ? kjLookup(ngP, "actions") : nullptr;
+            CorNode* actionsP = (ngP != nullptr) ? corTreeLookup(ngP, "actions") : nullptr;
 
             if (actionsP != nullptr)
             {
                 std::lock_guard<std::mutex> guard(serviceMutex);
 
-                for (KjNode* entryP = actionsP->value.firstChildP; entryP != nullptr; entryP = entryP->next)
+                for (CorNode* entryP = actionsP->value.firstChildP; entryP != nullptr; entryP = entryP->next)
                 {
-                    if ((entryP->name == nullptr) || (entryP->type != KjObject))
+                    if ((entryP->name == nullptr) || (entryP->type != CorObject))
                         continue;
 
-                    KjNode* typeP = kjLookup(entryP, "type");
+                    CorNode* typeP = corTreeLookup(entryP, "type");
 
-                    if ((typeP == nullptr) || (typeP->type != KjString))
+                    if ((typeP == nullptr) || (typeP->type != CorString))
                     {
                         KT_W("dds: action '%s' names no \"type\" - its goals cannot be sent", entryP->name);
                         continue;
