@@ -79,7 +79,7 @@ INCLUDE       = -I$(COR_LIBS) -I/usr/local/include
 CXXFLAGS      = -std=c++17 -O2 -Wall -Werror -fPIC $(INCLUDE) -MMD -MP
 
 #
-# The broker is linked rdynamic, so ktrace and the rest resolve from the running
+# The broker is linked rdynamic, so corLog and the rest resolve from the running
 # process at dlopen. Only the transport's own libraries are linked here.
 #
 LDFLAGS       = -L/usr/local/lib

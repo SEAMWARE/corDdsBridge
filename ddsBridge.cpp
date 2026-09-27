@@ -33,7 +33,7 @@
 
 extern "C"
 {
-#include "ktrace/kTrace.h"                             // KT_I, KT_W, KT_E, KT_T
+#include "corLog/corLog.h"                             // COR_I, COR_W, COR_E, COR_T
 #include "corJson/CorJson.h"                           // CorJson
 #include "corJson/corJsonCreate.h"                     // corJsonCreate
 #include "corJson/corJsonParse.h"                      // corJsonParse
@@ -171,7 +171,7 @@ void typeNotification(const char*          typeName,
                                                          serializedTypeInternal + serializedTypeInternalSize);
     }
 
-    KT_T(0, "dds: learned type '%s' (%u bytes)", typeName, serializedTypeInternalSize);
+    COR_T(0, "dds: learned type '%s' (%u bytes)", typeName, serializedTypeInternalSize);
 
     if (typesDirectory.empty() == true)
         return;
@@ -184,7 +184,7 @@ void typeNotification(const char*          typeName,
 
     if (fP == nullptr)
     {
-        KT_W("dds: cannot write type '%s' to '%s'", typeName, typesDirectory.c_str());
+        COR_W("dds: cannot write type '%s' to '%s'", typeName, typesDirectory.c_str());
         return;
     }
 
@@ -261,7 +261,7 @@ bool typeQuery(const char*                              typeName,
     serializedTypeInternal.reset(data);
     serializedTypeInternalSize = (uint32_t) size;
 
-    KT_T(0, "dds: loaded type '%s' from disk (%ld bytes)", typeName, size);
+    COR_T(0, "dds: loaded type '%s' from disk (%ld bytes)", typeName, size);
 
     return true;
 }
@@ -282,7 +282,7 @@ void topicNotification(const char* topicName, const eprosima::ddsenabler::partic
         topicStore[topicName] = topicInfo;
     }
 
-    KT_T(0, "dds: learned topic '%s' of type '%s'", topicName, topicInfo.type_name.c_str());
+    COR_T(0, "dds: learned topic '%s' of type '%s'", topicName, topicInfo.type_name.c_str());
 }
 
 
@@ -307,7 +307,7 @@ bool topicQuery(const char* topicName, eprosima::ddsenabler::participants::Topic
 
     if (it == topicStore.end())
     {
-        KT_T(0, "dds: topic '%s' has not been announced on this domain", topicName);
+        COR_T(0, "dds: topic '%s' has not been announced on this domain", topicName);
         return false;
     }
 
@@ -456,7 +456,7 @@ bool serviceQuery(const char* serviceName, eprosima::ddsenabler::participants::S
 
         if (it == discoveredService.end())
         {
-            KT_T(0, "dds: service '%s' is neither configured nor discovered - its types are unknown", serviceName);
+            COR_T(0, "dds: service '%s' is neither configured nor discovered - its types are unknown", serviceName);
             return false;
         }
     }
@@ -501,8 +501,8 @@ void serviceNotification(const char* serviceName, const eprosima::ddsenabler::pa
             discoveredService[serviceName] = { serviceInfo.request.type_name, serviceInfo.reply.type_name };
     }
 
-    KT_T(0, "dds: service '%s' discovered (request '%s', reply '%s')",
-         serviceName, serviceInfo.request.type_name.c_str(), serviceInfo.reply.type_name.c_str());
+    COR_T(0, "dds: service '%s' discovered (request '%s', reply '%s')",
+          serviceName, serviceInfo.request.type_name.c_str(), serviceInfo.reply.type_name.c_str());
 
     //
     // Not configured: the broker may carry it (ABI 8). Queued - this is an
@@ -649,7 +649,7 @@ static void discoveredDeliver(const char* endpoint, BridgeChannelKind kind)
 
     if ((broker->abiVersion < 8) || (broker->endpointDiscoveredIn == nullptr))
     {
-        KT_T(0, "dds: '%s' discovered - the host predates ABI 8, not reported", endpoint);
+        COR_T(0, "dds: '%s' discovered - the host predates ABI 8, not reported", endpoint);
         return;
     }
 
@@ -957,11 +957,11 @@ static void replyDeliver(const char* serviceName, const char* json, uint64_t req
     //
     if ((broker->abiVersion < 2) || (broker->sampleQualifiedIn == nullptr))
     {
-        KT_W("dds: a reply arrived on service '%s' but the host cannot take one - it predates the service contract", serviceName);
+        COR_W("dds: a reply arrived on service '%s' but the host cannot take one - it predates the service contract", serviceName);
         return;
     }
 
-    KT_T(0, "dds: reply to request %llu on service '%s'", (unsigned long long) requestId, serviceName);
+    COR_T(0, "dds: reply to request %llu on service '%s'", (unsigned long long) requestId, serviceName);
 
     //
     // A reply comes wrapped exactly as a sample does, and for the same reason -
@@ -1041,11 +1041,11 @@ void serviceRequestNotification(const char* serviceName, const char* json, uint6
 
     if (handler == nullptr)
     {
-        KT_W("dds: a request arrived on service '%s', which nothing here answers", serviceName);
+        COR_W("dds: a request arrived on service '%s', which nothing here answers", serviceName);
         return;
     }
 
-    KT_T(0, "dds: request %llu on service '%s'", (unsigned long long) requestId, serviceName);
+    COR_T(0, "dds: request %llu on service '%s'", (unsigned long long) requestId, serviceName);
 
     //
     // Unwrapped like everything else the Enabler delivers. A host answering a
@@ -1305,7 +1305,7 @@ static void dataDeliver(const char* topicName, const char* json, int64_t publish
         std::lock_guard<std::mutex> guard(carriedMutex);
         unwanted.insert(topicName);
 
-        KT_T(0, "dds: the broker has no use for topic '%s' - not offering it again", topicName);
+        COR_T(0, "dds: the broker has no use for topic '%s' - not offering it again", topicName);
     }
 }
 
@@ -1577,7 +1577,7 @@ static void goalDeliver(const Upcall& upcall)
 
     if (it == goalsByUuid.end())
     {
-        KT_T(0, "dds: an event for goal %s on '%s' - not a goal of ours, dropped", text.c_str(), upcall.endpoint.c_str());
+        COR_T(0, "dds: an event for goal %s on '%s' - not a goal of ours, dropped", text.c_str(), upcall.endpoint.c_str());
         return;
     }
 
@@ -1700,7 +1700,7 @@ static void goalSweep()
 
         if ((goal.terminalSeen == true) && (goal.resultSeen == false) && (now - goal.terminalAt > RESULT_WAIT))
         {
-            KT_W("dds: goal %s on '%s' ended without a result - closing it", goal.uuidText.c_str(), goal.endpoint.c_str());
+            COR_W("dds: goal %s on '%s' ended without a result - closing it", goal.uuidText.c_str(), goal.endpoint.c_str());
             goalEvent(goal, true, nullptr, nullptr, 0);
             uuidByToken.erase(goal.token);
             it = goalsByUuid.erase(it);
@@ -1761,7 +1761,7 @@ void actionNotification(const char* actionName, const eprosima::ddsenabler::part
     if (actionName == nullptr)
         return;
 
-    KT_T(0, "dds: action '%s' discovered (goal '%s')", actionName, actionInfo.goal.request.type_name.c_str());
+    COR_T(0, "dds: action '%s' discovered (goal '%s')", actionName, actionInfo.goal.request.type_name.c_str());
 
     //
     // The action's own type is its goal request's minus the suffix every
@@ -1772,7 +1772,7 @@ void actionNotification(const char* actionName, const eprosima::ddsenabler::part
 
     if ((goalType.size() <= suffix.size()) || (goalType.compare(goalType.size() - suffix.size(), suffix.size(), suffix) != 0))
     {
-        KT_T(0, "dds: action '%s': goal type '%s' is not <type>%s - not reported", actionName, goalType.c_str(), suffix.c_str());
+        COR_T(0, "dds: action '%s': goal type '%s' is not <type>%s - not reported", actionName, goalType.c_str(), suffix.c_str());
         return;
     }
 
@@ -1818,7 +1818,7 @@ bool actionQuery(const char* actionName, eprosima::ddsenabler::participants::Act
 
             if (it == discoveredAction.end())
             {
-                KT_T(0, "dds: action '%s' is neither configured nor discovered - its types are unknown", actionName);
+                COR_T(0, "dds: action '%s' is neither configured nor discovered - its types are unknown", actionName);
                 return false;
             }
         }
@@ -1855,7 +1855,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
 
     if (configFile == nullptr)
     {
-        KT_E("the dds bridge needs a configuration file - none was given (--bridgeConfig)");
+        COR_E("the dds bridge needs a configuration file - none was given (--bridgeConfig)");
         return BRIDGE_ERR;
     }
 
@@ -1898,7 +1898,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
             if ((dirP != nullptr) && (dirP->type == CorString) && (dirP->value.s != nullptr))
             {
                 typesDirectory = dirP->value.s;
-                KT_I("dds: types are kept in '%s'", typesDirectory.c_str());
+                COR_I("dds: types are kept in '%s'", typesDirectory.c_str());
             }
 
             //
@@ -1930,7 +1930,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
 
                     serviceConfig[entryP->name] = types;
 
-                    KT_I("dds: service '%s' (%s -> %s)", entryP->name, types.request.c_str(), types.reply.c_str());
+                    COR_I("dds: service '%s' (%s -> %s)", entryP->name, types.request.c_str(), types.reply.c_str());
                 }
             }
 
@@ -1954,12 +1954,12 @@ int init(const char* configFile, const BridgeBroker* brokerP)
 
                     if ((typeP == nullptr) || (typeP->type != CorString))
                     {
-                        KT_W("dds: action '%s' names no \"type\" - its goals cannot be sent", entryP->name);
+                        COR_W("dds: action '%s' names no \"type\" - its goals cannot be sent", entryP->name);
                         continue;
                     }
 
                     actionConfig[entryP->name] = typeP->value.s;
-                    KT_I("dds: action '%s' (%s)", entryP->name, typeP->value.s);
+                    COR_I("dds: action '%s' (%s)", entryP->name, typeP->value.s);
                 }
             }
 
@@ -2000,12 +2000,12 @@ int init(const char* configFile, const BridgeBroker* brokerP)
 
     if (eprosima::ddsenabler::create_dds_enabler(configFile, callbacks, enabler) == false)
     {
-        KT_E("unable to create the DDS Enabler from '%s'", configFile);
+        COR_E("unable to create the DDS Enabler from '%s'", configFile);
         upcallsStop();
         return BRIDGE_ERR;
     }
 
-    KT_I("dds bridge up, configured from '%s'", configFile);
+    COR_I("dds bridge up, configured from '%s'", configFile);
 
     return BRIDGE_OK;
 }
@@ -2068,7 +2068,7 @@ int channelAdd(const char* endpoint, BridgeChannelKind kind, BridgeDirection dir
     carried[endpoint] = { kind, direction };
     unwanted.erase(endpoint);
 
-    KT_T(0, "dds: carrying %s '%s'", (kind == BridgeChannelAction) ? "action" : (kind == BridgeChannelService) ? "service" : "topic", endpoint);
+    COR_T(0, "dds: carrying %s '%s'", (kind == BridgeChannelAction) ? "action" : (kind == BridgeChannelService) ? "service" : "topic", endpoint);
 
     return BRIDGE_OK;
 }
@@ -2132,11 +2132,11 @@ int publish(const char* endpoint, const char* json)
 
     if (known == true)
     {
-        KT_W("dds: '%s' refused on topic '%s' - it does not fit the topic's type", json, endpoint);
+        COR_W("dds: '%s' refused on topic '%s' - it does not fit the topic's type", json, endpoint);
         return BRIDGE_BAD_INPUT;
     }
 
-    KT_W("dds: cannot publish on topic '%s' - it has not been announced on this domain", endpoint);
+    COR_W("dds: cannot publish on topic '%s' - it has not been announced on this domain", endpoint);
     return BRIDGE_ERR;
 }
 
@@ -2178,14 +2178,14 @@ int serviceInvoke(const char* endpoint, const char* json)
         // log: nobody is serving the endpoint, or the payload does not fit the
         // request type. The Enabler answers false to both.
         //
-        KT_W("dds: could not send a request to service '%s' - no server, or the payload does not fit '%s'",
-             endpoint, json);
+        COR_W("dds: could not send a request to service '%s' - no server, or the payload does not fit '%s'",
+              endpoint, json);
         return BRIDGE_ERR;
     }
 
     sentRemember(requestId, endpoint, json, std::chrono::steady_clock::now());
 
-    KT_T(0, "dds: request %llu sent to service '%s'", (unsigned long long) requestId, endpoint);
+    COR_T(0, "dds: request %llu sent to service '%s'", (unsigned long long) requestId, endpoint);
 
     return BRIDGE_OK;
 }
@@ -2227,16 +2227,16 @@ int serviceInvokeTracked(const char* endpoint, const char* json, uint64_t token)
 
     if (enabler->send_service_request(endpoint, json, requestId) == false)
     {
-        KT_W("dds: could not send a request to service '%s' - no server, or the payload does not fit '%s'",
-             endpoint, json);
+        COR_W("dds: could not send a request to service '%s' - no server, or the payload does not fit '%s'",
+              endpoint, json);
         return BRIDGE_ERR;
     }
 
     trackedRequests[requestId] = TrackedRequest{ token, now };
     sentRemember(requestId, endpoint, json, now);
 
-    KT_T(0, "dds: request %llu sent to service '%s', waited for (token %llu)",
-         (unsigned long long) requestId, endpoint, (unsigned long long) token);
+    COR_T(0, "dds: request %llu sent to service '%s', waited for (token %llu)",
+          (unsigned long long) requestId, endpoint, (unsigned long long) token);
 
     return BRIDGE_OK;
 }
@@ -2267,7 +2267,7 @@ int actionGoalSend(const char* endpoint, const char* json, uint64_t token)
 
     if (enabler->send_action_goal(endpoint, json, uuid) == false)
     {
-        KT_W("dds: could not send a goal to action '%s' - no server, or the goal does not fit its type", endpoint);
+        COR_W("dds: could not send a goal to action '%s' - no server, or the goal does not fit its type", endpoint);
         return BRIDGE_ERR;
     }
 
@@ -2280,7 +2280,7 @@ int actionGoalSend(const char* endpoint, const char* json, uint64_t token)
     goalsByUuid[goal.uuidText] = goal;
     uuidByToken[token]         = goal.uuidText;
 
-    KT_T(0, "dds: goal %s sent to action '%s' (token %llu)", goal.uuidText.c_str(), endpoint, (unsigned long long) token);
+    COR_T(0, "dds: goal %s sent to action '%s' (token %llu)", goal.uuidText.c_str(), endpoint, (unsigned long long) token);
 
     return BRIDGE_OK;
 }
@@ -2321,11 +2321,11 @@ int actionGoalCancel(const char* endpoint, uint64_t token)
 
     if (enabler->cancel_action_goal(endpoint, uuid) == false)
     {
-        KT_W("dds: could not send the cancellation of goal %s on '%s'", text.c_str(), endpoint);
+        COR_W("dds: could not send the cancellation of goal %s on '%s'", text.c_str(), endpoint);
         return BRIDGE_ERR;
     }
 
-    KT_T(0, "dds: cancellation of goal %s sent to '%s'", text.c_str(), endpoint);
+    COR_T(0, "dds: cancellation of goal %s sent to '%s'", text.c_str(), endpoint);
 
     return BRIDGE_OK;
 }
@@ -2363,11 +2363,11 @@ static int serviceServe(const char* endpoint, BridgeServiceRequestFunc handler)
         std::lock_guard<std::mutex> guard(serviceMutex);
         served.erase(endpoint);
 
-        KT_W("dds: could not announce service '%s' - are its types configured, and on disk?", endpoint);
+        COR_W("dds: could not announce service '%s' - are its types configured, and on disk?", endpoint);
         return BRIDGE_ERR;
     }
 
-    KT_I("dds: serving '%s'", endpoint);
+    COR_I("dds: serving '%s'", endpoint);
 
     return BRIDGE_OK;
 }
@@ -2412,12 +2412,12 @@ static int serviceReply(const char* endpoint, uint64_t requestId, const char* js
 
     if (enabler->send_service_reply(endpoint, json, requestId) == false)
     {
-        KT_W("dds: could not reply to request %llu on service '%s' - answered already, or never asked",
-             (unsigned long long) requestId, endpoint);
+        COR_W("dds: could not reply to request %llu on service '%s' - answered already, or never asked",
+              (unsigned long long) requestId, endpoint);
         return BRIDGE_NOT_FOUND;
     }
 
-    KT_T(0, "dds: replied to request %llu on service '%s'", (unsigned long long) requestId, endpoint);
+    COR_T(0, "dds: replied to request %llu on service '%s'", (unsigned long long) requestId, endpoint);
 
     return BRIDGE_OK;
 }
