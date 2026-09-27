@@ -1125,7 +1125,7 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
     //
     if ((topicP == nullptr) && (treeP != nullptr) && (treeP->type == CorObject))
     {
-        for (CorNode* childP = treeP->value.firstChildP; childP != nullptr; childP = childP->next)
+        for (CorNode* childP = treeP->value.head; childP != nullptr; childP = childP->next)
         {
             if ((childP->type == CorObject) && (corTreeLookup(childP, "data") != nullptr))
             {
@@ -1136,7 +1136,7 @@ static bool sampleUnwrap(const char* topicName, const char* json, std::string& p
     }
 
     CorNode* dataP = ((topicP != nullptr) && (topicP->type == CorObject)) ? corTreeLookup(topicP, "data") : nullptr;
-    CorNode* sampleP = ((dataP != nullptr) && (dataP->type == CorObject)) ? dataP->value.firstChildP  : nullptr;
+    CorNode* sampleP = ((dataP != nullptr) && (dataP->type == CorObject)) ? dataP->value.head         : nullptr;
 
     if (sampleP != nullptr)
     {
@@ -1916,7 +1916,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
             {
                 std::lock_guard<std::mutex> guard(serviceMutex);
 
-                for (CorNode* entryP = servicesP->value.firstChildP; entryP != nullptr; entryP = entryP->next)
+                for (CorNode* entryP = servicesP->value.head; entryP != nullptr; entryP = entryP->next)
                 {
                     if ((entryP->name == nullptr) || (entryP->type != CorObject))
                         continue;
@@ -1945,7 +1945,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
             {
                 std::lock_guard<std::mutex> guard(serviceMutex);
 
-                for (CorNode* entryP = actionsP->value.firstChildP; entryP != nullptr; entryP = entryP->next)
+                for (CorNode* entryP = actionsP->value.head; entryP != nullptr; entryP = entryP->next)
                 {
                     if ((entryP->name == nullptr) || (entryP->type != CorObject))
                         continue;
