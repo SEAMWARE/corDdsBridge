@@ -1866,7 +1866,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
     //
     {
         //
-        // fopen and not kFileRead: given an empty base, kFileRead does not
+        // fopen and not corFileRead: given an empty base, corFileRead does not
         // resolve a plain relative path, and the failure here is SILENT - the
         // typesDirectory would simply never be picked up for anyone who passed
         // --bridgeConfig a relative path.
