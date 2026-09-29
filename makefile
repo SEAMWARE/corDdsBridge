@@ -79,6 +79,17 @@ INCLUDE       = -I$(COR_LIBS) -I/usr/local/include
 CXXFLAGS      = -std=c++17 -O2 -Wall -Werror -fPIC $(INCLUDE) -MMD -MP
 
 #
+# BUILD - debug (the default) or release, as every cor lib; corLibs passes it down.
+# Traces (COR_T) are compiled in for a debug build only - see corLog.h. A dds.so
+# built without them answers no trace level at all.
+#
+BUILD        ?= debug
+
+ifeq ($(BUILD),debug)
+CXXFLAGS     += -DCOR_T_ON
+endif
+
+#
 # The broker is linked rdynamic, so corLog and the rest resolve from the running
 # process at dlopen. Only the transport's own libraries are linked here.
 #
@@ -114,7 +125,17 @@ ddsCheck:
 $(PLUGIN): $(OBJS)
 	$(CXX) -shared $(OBJS) -o $(PLUGIN) $(LDFLAGS) $(LIBS) -Wl,-rpath,/usr/local/lib
 
-%.o: %.cpp
+#
+# The objects sit beside the sources, one flavour at a time: .flags holds the
+# compile line they were built with, and a different one (BUILD=release after a
+# debug build) rebuilds them instead of installing the other flavour's.
+#
+.flags: FORCE
+	@echo '$(CXXFLAGS)' | cmp -s - $@ || echo '$(CXXFLAGS)' > $@
+
+FORCE:
+
+%.o: %.cpp .flags
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 install: all
@@ -125,7 +146,7 @@ di: install
 ci: clean install
 
 clean:
-	rm -f *.o *.d *.so *~
+	rm -f *.o *.d *.so *~ .flags
 
 endif
 
