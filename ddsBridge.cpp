@@ -84,6 +84,18 @@ struct Carried
 std::map<std::string, Carried>  carried;
 std::mutex                      carriedMutex;
 
+
+
+// -----------------------------------------------------------------------------
+//
+// isCarried - does a Channel of the broker's carry this endpoint (it was handed over by channelAdd)
+//
+static bool isCarried(const char* endpoint)
+{
+    std::lock_guard<std::mutex> guard(carriedMutex);
+    return carried.find(endpoint) != carried.end();
+}
+
 //
 // unwanted - the topics the BROKER has already refused
 //
@@ -407,6 +419,7 @@ std::mutex                           serviceMutex;
 // broker carries them (endpointDiscoveredIn -> channelAdd). serviceMutex.
 //
 static std::map<std::string, ServiceTypes>  discoveredService;
+static std::set<std::string>                 discoveredEndpoints;        // every service and action discovered, configured or not
 static std::map<std::string, std::string>   discoveredAction;           // action -> its type (the goal request's, minus _SendGoal_Request_)
 
 static void upcallDiscoveredQueueAdd(const char* endpoint, BridgeChannelKind kind);
@@ -495,6 +508,7 @@ void serviceNotification(const char* serviceName, const eprosima::ddsenabler::pa
     {
         std::lock_guard<std::mutex> guard(serviceMutex);
         discoveredRequestType[serviceName] = serviceInfo.request.type_name;
+        discoveredEndpoints.insert(serviceName);
 
         unconfigured = (serviceConfig.find(serviceName) == serviceConfig.end());
         if (unconfigured == true)
@@ -505,10 +519,16 @@ void serviceNotification(const char* serviceName, const eprosima::ddsenabler::pa
           serviceName, serviceInfo.request.type_name.c_str(), serviceInfo.reply.type_name.c_str());
 
     //
-    // Not configured: the broker may carry it (ABI 8). Queued - this is an
-    // Enabler callback, inside its lock, and the broker calls channelAdd back.
+    // Reported to the broker (ABI 8) when it is not configured - the broker may
+    // carry it - or when a Channel of the broker's carries it already: that
+    // Channel then shows it was found (endpointDiscovered), the one way anybody
+    // outside this plugin, a test included, can know that a request now has a
+    // server to reach. One configured here that no Channel carries is not
+    // reported: the broker would put it on its catch-all, which configuring it
+    // never asked for. Queued - this is an Enabler callback, inside its lock,
+    // and the broker may call channelAdd back.
     //
-    if (unconfigured == true)
+    if ((unconfigured == true) || (isCarried(serviceName) == true))
         upcallDiscoveredQueueAdd(serviceName, BridgeChannelService);
 }
 
@@ -608,7 +628,7 @@ static void upcallQueueAdd(UpcallKind kind, const char* endpoint, const char* js
 
 // -----------------------------------------------------------------------------
 //
-// upcallDiscoveredQueueAdd - a service or action nobody configured, on an ENABLER thread: queue, return
+// upcallDiscoveredQueueAdd - a service or action discovered, on an ENABLER thread: queue, return
 //
 static void upcallDiscoveredQueueAdd(const char* endpoint, BridgeChannelKind kind)
 {
@@ -1781,12 +1801,13 @@ void actionNotification(const char* actionName, const eprosima::ddsenabler::part
     {
         std::lock_guard<std::mutex> guard(serviceMutex);
 
+        discoveredEndpoints.insert(actionName);
         unconfigured = (actionConfig.find(actionName) == actionConfig.end());
         if (unconfigured == true)
             discoveredAction[actionName] = goalType.substr(0, goalType.size() - suffix.size());
     }
 
-    if (unconfigured == true)
+    if ((unconfigured == true) || (isCarried(actionName) == true))
         upcallDiscoveredQueueAdd(actionName, BridgeChannelAction);    // see serviceNotification
 }
 
@@ -2064,11 +2085,37 @@ int channelAdd(const char* endpoint, BridgeChannelKind kind, BridgeDirection dir
     // this plugin will accept a serviceInvoke() for, and one whose reply the
     // broker has somewhere to put.
     //
-    std::lock_guard<std::mutex> guard(carriedMutex);
-    carried[endpoint] = { kind, direction };
-    unwanted.erase(endpoint);
+    {
+        std::lock_guard<std::mutex> guard(carriedMutex);
+        carried[endpoint] = { kind, direction };
+        unwanted.erase(endpoint);
+    }
 
     COR_T(0, "dds: carrying %s '%s'", (kind == BridgeChannelAction) ? "action" : (kind == BridgeChannelService) ? "service" : "topic", endpoint);
+
+    //
+    // Discovered BEFORE the broker handed its Channel over - init() starts the
+    // Enabler, and discovery with it, before the broker adds its Channels - so
+    // serviceNotification / actionNotification found it not carried and did not
+    // report it. Reported now: each side records its half (discovered, carried)
+    // before it looks at the other's, so at least one of them reports; both
+    // reporting is harmless. Only a CONFIGURED one: an unconfigured one arrives
+    // here from inside the broker's own handling of its report (on the upcall
+    // thread, which must not queue to itself), already marked.
+    //
+    if ((kind == BridgeChannelService) || (kind == BridgeChannelAction))
+    {
+        bool report;
+
+        {
+            std::lock_guard<std::mutex> guard(serviceMutex);
+            report = (discoveredEndpoints.find(endpoint) != discoveredEndpoints.end()) &&
+                     ((serviceConfig.find(endpoint) != serviceConfig.end()) || (actionConfig.find(endpoint) != actionConfig.end()));
+        }
+
+        if (report == true)
+            upcallDiscoveredQueueAdd(endpoint, kind);
+    }
 
     return BRIDGE_OK;
 }
