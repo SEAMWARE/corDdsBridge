@@ -85,8 +85,20 @@ running process, which is linked `rdynamic`.
 
 ## State
 
-Topics only. `channelAdd` answers `BRIDGE_UNSUPPORTED` for services and
-actions, which is the contract's way of saying not yet.
+Topics, services and actions:
+
+- **topics** — samples in (`sampleIn` and its qualified / meta forms) and `publish` out;
+- **services** — a request sent with `serviceInvoke` / `serviceInvokeTracked`, its reply back as
+  `replyIn`; `dds.ngsild.services` in the configuration names each one's `requestType` and
+  `replyType` (default `<name>_Request` / `<name>_Response`);
+- **actions** — goals sent with `actionGoalSend`, cancelled with `actionGoalCancel`, their
+  feedback and result back as goal events; `dds.ngsild.actions` names each one's ROS 2 action
+  `type`;
+- services and actions the DDS network announces are reported to the broker as discovered
+  endpoints (`endpointDiscoveredIn`).
+
+Each slot is filled only when the broker's bridge ABI has it (`ddsRegister.cpp`). What the broker
+makes of them: coraine's [DDS in coraine](https://github.com/SEAMWARE/coraine/blob/main/doc/dds.md).
 
 ---
 
