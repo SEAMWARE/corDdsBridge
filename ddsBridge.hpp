@@ -60,6 +60,7 @@ int   serviceInvoke(const char* endpoint, const char* json);
 int   serviceInvokeTracked(const char* endpoint, const char* json, uint64_t token);
 int   actionGoalSend(const char* endpoint, const char* json, uint64_t token);
 int   actionGoalCancel(const char* endpoint, uint64_t token);
+int   inventory(const char* from, int depth, int timeoutMs, char** jsonP, char* errBuf, int errBufLen);
 const BridgeServer* serverIface();
 const char* versionInfo();
 
