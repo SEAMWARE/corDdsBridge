@@ -36,8 +36,9 @@ which attribute is a Channel, and Channels live in the broker.
 
 ## Configuration
 
-One file, shared with the broker, because the Enabler reads
-`dds.ddsmodule` and the broker reads `dds.ngsild`:
+One file, shared with the broker: `dds.ddsmodule` is the DDS Enabler's
+configuration (this plugin reads it and hands it to the Enabler) and the broker
+reads `dds.ngsild`:
 
 ```jsonc
 {
@@ -55,6 +56,49 @@ One file, shared with the broker, because the Enabler reads
 ```sh
 coraine --bridges dds --bridgeConfig /path/to/that.json
 ```
+
+### Reaching the DDS system - `dds.ddsmodule.dds`
+
+The Enabler joins the DDS system as one participant. These members of
+`dds.ddsmodule.dds` decide which participants it finds:
+
+| Member | Values | Default |
+|---|---|---|
+| `domain` | the DDS domain, 0-232 (ROS 2: `ROS_DOMAIN_ID`) | 0 |
+| `transport` | `builtin` (shared memory and UDP), `udp`, `shm` | `builtin` |
+| `whitelist-interfaces` | a list of IPv4 addresses of this host's interfaces - UDP uses only those | all interfaces |
+| `ignore-participant-flags` | `no_filter`, `filter_different_host`, `filter_different_process`, `filter_same_process`, `filter_different_and_same_process` | `no_filter` |
+| `allowlist`, `blocklist` | lists of `{"name": "<topic>", "type": "<type>"}`, `*` and `?` wildcards | everything |
+
+```jsonc
+"ddsmodule": {
+  "dds": {
+    "domain": 0,
+    "transport": "udp",
+    "whitelist-interfaces": ["192.168.1.138"]
+  }
+}
+```
+
+- Discovery is DDS's own: multicast (239.255.0.1) plus the participants on this
+  host. It reaches the participants on the same host and on the same network
+  segment; it does not cross a router, a VPN or a NAT.
+- `shm` reaches only participants on the same host and sharing `/dev/shm` - a
+  container without `--ipc=host` does not.
+- `whitelist-interfaces` takes addresses, not interface names. With none of
+  them on this host, the participant finds nothing; Fast DDS logs `All
+  whitelist interfaces were filtered out`.
+- A ROS 2 Discovery Server, unicast initial peers and Fast DDS XML profiles are
+  not reachable through this configuration: the Enabler 1.2.2's participant
+  reads none of them, and removes `ROS_DISCOVERY_SERVER` from the environment
+  before it is created.
+- A change of the file reloads `allowlist`, `blocklist` and `topics` while the
+  broker runs. `domain`, `transport`, `whitelist-interfaces` and
+  `ignore-participant-flags` are read once, at start.
+- This plugin reads `dds.ddsmodule` itself and gives it to the Enabler as a
+  YAML node, at start and on every change of the file. The Enabler's own
+  reading of the file turns every plain value of a list into a map, and refuses
+  `"whitelist-interfaces": ["127.0.0.1"]`.
 
 ## Build
 
