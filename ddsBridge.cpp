@@ -32,6 +32,9 @@
 #include <ddsenabler/dds_enabler_runner.hpp>           // create_dds_enabler
 #include <ddsenabler/DDSEnabler.hpp>                   // DDSEnabler
 #include <ddsenabler/CallbackSet.hpp>                  // CallbackSet
+#include <ddsenabler_yaml/EnablerConfiguration.hpp>    // EnablerConfiguration
+#include <yaml-cpp/yaml.h>                             // YAML::Node
+#include <cpp_utils/event/FileWatcherHandler.hpp>      // FileWatcherHandler
 
 extern "C"
 {
@@ -65,6 +68,7 @@ const char*          bridgeAlias = "dds";
 namespace {
 
 std::shared_ptr<eprosima::ddsenabler::DDSEnabler>  enabler;
+std::unique_ptr<eprosima::utils::event::FileWatcherHandler>  configWatcher;   // the --bridgeConfig file (configReload)
 
 //
 // Which endpoints the broker asked for.
@@ -1916,6 +1920,130 @@ bool actionQuery(const char* actionName, eprosima::ddsenabler::participants::Act
 
 // -----------------------------------------------------------------------------
 //
+// moduleToYaml - dds.ddsmodule as the YAML node the Enabler's configuration is read from
+//
+// A list's scalars stay scalars. A null member is left out, as the Enabler's own converter does: its
+// reader takes a present tag for a value.
+//
+static YAML::Node moduleToYaml(const CorNode* nodeP)
+{
+    YAML::Node yaml;
+
+    switch (nodeP->type)
+    {
+    case CorString:   yaml = std::string(nodeP->value.s); break;
+    case CorInt:      yaml = nodeP->value.i; break;
+    case CorFloat:    yaml = nodeP->value.f; break;
+    case CorBoolean:  yaml = nodeP->value.b; break;
+
+    case CorObject:
+        for (const CorNode* childP = nodeP->value.head; childP != nullptr; childP = childP->next)
+        {
+            if (childP->type != CorNull)
+                yaml[std::string(childP->name)] = moduleToYaml(childP);
+        }
+        break;
+
+    case CorArray:
+        for (const CorNode* childP = nodeP->value.head; childP != nullptr; childP = childP->next)
+            yaml.push_back(moduleToYaml(childP));
+        break;
+
+    default:
+        break;
+    }
+
+    return yaml;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// moduleLoad - dds.ddsmodule of the file at 'path', as a YAML node (moduleToYaml)
+//
+// FALSE when the file cannot be read or holds no dds.ddsmodule object.
+//
+static bool moduleLoad(const char* path, YAML::Node& yaml)
+{
+    FILE* fP = fopen(path, "r");
+
+    if (fP == nullptr)
+        return false;
+
+    fseek(fP, 0, SEEK_END);
+    long size = ftell(fP);
+    fseek(fP, 0, SEEK_SET);
+
+    std::vector<char> buf((size > 0) ? size + 1 : 1, 0);
+    bool              read = (size > 0) && (fread(buf.data(), 1, (size_t) size, fP) == (size_t) size);
+
+    fclose(fP);
+
+    if (read == false)
+        return false;
+
+    char      kallocBuffer[8192];
+    CorAlloc  kalloc;
+    CorJson   corJson;
+
+    corAllocBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 8 * 1024, nullptr, "ddsModule");
+
+    CorJson* corJsonP = corJsonCreate(&corJson, &kalloc);
+    CorNode* treeP    = corJsonParse(corJsonP, buf.data());
+    CorNode* ddsP     = (treeP != nullptr) ? corTreeLookup(treeP, "dds")       : nullptr;
+    CorNode* moduleP  = (ddsP  != nullptr) ? corTreeLookup(ddsP, "ddsmodule") : nullptr;
+    bool     found    = (moduleP != nullptr) && (moduleP->type == CorObject);
+
+    if (found == true)
+        yaml = moduleToYaml(moduleP);
+
+    corAllocBufferReset(&kalloc, true);
+
+    return found;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// configReload - the --bridgeConfig file changed: its dds.ddsmodule to the running Enabler
+//
+// The Enabler applies what a running pipe can change - allowlist, blocklist and topics; the participant
+// (domain, transport, interfaces) stays as it was started. Called on the file watcher's thread, twice
+// per change (FileWatcherHandler); the second finds nothing changed. 'path' is the path init was given:
+// the watcher's own argument is the file's name only.
+//
+static void configReload(const std::string& path)
+{
+    YAML::Node ddsModule;
+
+    if (moduleLoad(path.c_str(), ddsModule) == false)
+    {
+        COR_W("dds: '%s' changed and holds no readable dds.ddsmodule - the running configuration stays", path.c_str());
+        return;
+    }
+
+    try
+    {
+        eprosima::ddsenabler::yaml::EnablerConfiguration configuration(ddsModule);
+        eprosima::utils::ReturnCode                     ret = enabler->reload_configuration(configuration);
+
+        if (ret == eprosima::utils::ReturnCode::RETCODE_OK)
+            COR_I("dds: configuration reloaded from '%s'", path.c_str());
+        else if (ret != eprosima::utils::ReturnCode::RETCODE_NO_DATA)
+            COR_W("dds: '%s' changed and the Enabler refused it - the running configuration stays", path.c_str());
+    }
+    catch (const std::exception& e)
+    {
+        COR_W("dds: '%s' changed: %s - the running configuration stays", path.c_str(), e.what());
+    }
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // init -
 //
 int init(const char* configFile, const BridgeBroker* brokerP)
@@ -2041,6 +2169,14 @@ int init(const char* configFile, const BridgeBroker* brokerP)
         }
     }
 
+    YAML::Node ddsModule;
+
+    if (moduleLoad(configFile, ddsModule) == false)
+    {
+        COR_E("no dds.ddsmodule object read from '%s' - the DDS Enabler's configuration", configFile);
+        return BRIDGE_ERR;
+    }
+
     eprosima::ddsenabler::CallbackSet callbacks{};
 
     callbacks.log                    = logConsumer;
@@ -2071,7 +2207,38 @@ int init(const char* configFile, const BridgeBroker* brokerP)
     upcallsStart();
     discoverySeen();                                   // discovery starts now - see inventorySettle
 
-    if (eprosima::ddsenabler::create_dds_enabler(configFile, callbacks, enabler) == false)
+    //
+    // ⭐ THE ENABLER IS GIVEN ITS SECTION AS A YAML NODE BUILT HERE, NOT THE FILE.
+    //
+    // Given the file, the Enabler converts dds.ddsmodule from JSON to YAML itself, and that converter turns
+    // every scalar of a list into a one-member map: "whitelist-interfaces": ["127.0.0.1"] fails with "Trying
+    // to read a primitive value ... from a non scalar yaml" and the bridge does not start. moduleToYaml keeps
+    // a list's scalars scalars.
+    //
+    // The file watcher is this plugin's for the same reason (configReload): the Enabler's own, which the
+    // file-path overload sets, reloads through that converter and refuses the file.
+    //
+    bool created = false;
+
+    try
+    {
+        eprosima::ddsenabler::yaml::EnablerConfiguration configuration(ddsModule);
+
+        created = eprosima::ddsenabler::create_dds_enabler(configuration, callbacks, enabler);
+
+        if (created == true)
+        {
+            std::string path(configFile);
+
+            configWatcher = std::make_unique<eprosima::utils::event::FileWatcherHandler>([path](std::string) { configReload(path); }, path);
+        }
+    }
+    catch (const std::exception& e)
+    {
+        COR_E("dds.ddsmodule in '%s': %s", configFile, e.what());
+    }
+
+    if (created == false)
     {
         COR_E("unable to create the DDS Enabler from '%s'", configFile);
         upcallsStop();
@@ -2102,6 +2269,7 @@ void close()
         unwanted.clear();
     }
 
+    configWatcher.reset();                             // before the Enabler a reload reaches
     enabler.reset();
     upcallsStop();
 

@@ -48,7 +48,8 @@ DDS_JSON_HEADER = /usr/include/nlohmann/json.hpp
 #
 # And the same story again: ddspipe_yaml/Yaml.hpp includes <yaml-cpp/yaml.h>.
 # Found by a docker build that had nlohmann and not this one, and failed with
-# a fatal error naming ddspipe_yaml.
+# a fatal error naming ddspipe_yaml. Linked too (-lyaml-cpp): init builds the
+# Enabler's configuration as a YAML node itself (moduleToYaml).
 #
 # Debian/Ubuntu: libyaml-cpp-dev
 #
@@ -96,7 +97,7 @@ endif
 LDFLAGS       = -L/usr/local/lib
 LIBS          = -lddsenabler -lddsenabler_participants -lddsenabler_yaml \
                 -lddspipe_core -lddspipe_participants -lddspipe_yaml \
-                -lcpp_utils -lfastdds -lfastcdr -lpthread
+                -lcpp_utils -lfastdds -lfastcdr -lyaml-cpp -lpthread
 
 SOURCES       = ddsBridge.cpp ddsRegister.cpp
 OBJS          = $(SOURCES:.cpp=.o)
