@@ -9,6 +9,8 @@
 
 #include <cstdio>                                      // snprintf, fopen, fread, fwrite
 #include <cstring>                                     // strcmp, memcpy
+#include <algorithm>                                   // std::min
+#include <atomic>                                      // std::atomic
 #include <map>                                         // std::map
 #include <mutex>                                       // std::mutex, std::recursive_mutex
 #include <chrono>                                      // std::chrono::steady_clock
@@ -43,6 +45,10 @@ extern "C"
 #include "corAlloc/CorAlloc.h"                         // CorAlloc
 #include "corAlloc/corAllocBufferInit.h"               // corAllocBufferInit
 #include "corAlloc/corAllocBufferReset.h"              // corAllocBufferReset
+#include "corAlloc/corAllocStrdup.h"                   // corAllocStrdup
+#include "corTree/corTreeBuilder.h"                    // corTreeObject, corTreeArray, corTreeString, corTreeBoolean, corTreeChildAdd
+#include "corTree/corTreeChildPrepend.h"               // corTreeChildPrepend
+#include "corBase/corTimeIso.h"                        // corTimeIso
 }
 
 #include "ddsBridge.hpp"                               // Own interface
@@ -136,6 +142,39 @@ std::map<std::string, eprosima::ddsenabler::participants::TopicInfo>  topicStore
 std::mutex                                         discoveryMutex;
 
 //
+// What a type looks like to a PERSON, for the inventory (ABI 14): the IDL text
+// and the Enabler's JSON skeleton of a sample - every member, at its type's
+// zero value. typeStore keeps what the Enabler needs; this keeps what a mapping
+// tool shows. discoveryMutex.
+//
+struct TypeText
+{
+    std::string  idl;
+    std::string  sample;
+};
+
+std::map<std::string, TypeText>  typeText;
+
+//
+// When the DDS system last told us anything - a topic, a type, a service, an
+// action - in steady_clock nanoseconds. Set when the Enabler starts, too: the
+// inventory waits for discovery to go quiet (inventorySettle), and an empty
+// network is quiet only once it has had the time to say something.
+//
+std::atomic<int64_t>  discoveryLastNs{0};
+
+
+
+// -----------------------------------------------------------------------------
+//
+// discoverySeen - the DDS system just told us something
+//
+static void discoverySeen()
+{
+    discoveryLastNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+//
 // Where a discovered type is kept between runs. From dds.ngsild.typesDirectory;
 // empty means types live only as long as the process, which is correct but
 // means a restart is blind until every publisher has announced itself again.
@@ -163,7 +202,8 @@ std::string typePath(const char* typeName)
 //
 // Kept in memory, and written to typesDirectory if there is one. The bytes are
 // the Enabler's INTERNAL representation, not the IDL text: it is what
-// type_query has to hand back, so it is what gets stored.
+// type_query has to hand back, so it is what gets stored. The IDL text and the
+// sample skeleton are kept beside it, in memory only, for the inventory.
 //
 void typeNotification(const char*          typeName,
                       const char*          serializedType,
@@ -171,9 +211,6 @@ void typeNotification(const char*          typeName,
                       uint32_t             serializedTypeInternalSize,
                       const char*          dataPlaceholder)
 {
-    (void) serializedType;                             // the IDL text, of interest to a human and not to us
-    (void) dataPlaceholder;
-
     if ((typeName == nullptr) || (serializedTypeInternal == nullptr) || (serializedTypeInternalSize == 0))
         return;
 
@@ -181,7 +218,11 @@ void typeNotification(const char*          typeName,
         std::lock_guard<std::mutex> guard(discoveryMutex);
         typeStore[typeName] = std::vector<unsigned char>(serializedTypeInternal,
                                                          serializedTypeInternal + serializedTypeInternalSize);
+        typeText[typeName]  = { (serializedType  != nullptr) ? serializedType  : "",
+                                (dataPlaceholder != nullptr) ? dataPlaceholder : "" };
     }
+
+    discoverySeen();
 
     COR_T(0, "dds: learned type '%s' (%u bytes)", typeName, serializedTypeInternalSize);
 
@@ -293,6 +334,8 @@ void topicNotification(const char* topicName, const eprosima::ddsenabler::partic
         std::lock_guard<std::mutex> guard(discoveryMutex);
         topicStore[topicName] = topicInfo;
     }
+
+    discoverySeen();
 
     COR_T(0, "dds: learned topic '%s' of type '%s'", topicName, topicInfo.type_name.c_str());
 }
@@ -422,6 +465,13 @@ static std::map<std::string, ServiceTypes>  discoveredService;
 static std::set<std::string>                 discoveredEndpoints;        // every service and action discovered, configured or not
 static std::map<std::string, std::string>   discoveredAction;           // action -> its type (the goal request's, minus _SendGoal_Request_)
 
+//
+// Every service and action as the domain announced it, configured or not -
+// names, types and QoS, for the inventory (ABI 14). serviceMutex.
+//
+static std::map<std::string, eprosima::ddsenabler::participants::ServiceInfo>  announcedService;
+static std::map<std::string, eprosima::ddsenabler::participants::ActionInfo>   announcedAction;
+
 static void upcallDiscoveredQueueAdd(const char* endpoint, BridgeChannelKind kind);
 
 //
@@ -486,34 +536,28 @@ bool serviceQuery(const char* serviceName, eprosima::ddsenabler::participants::S
 //
 // serviceNotification - a service was discovered on the domain
 //
-// Nothing is kept: what this plugin would need from it - the type names - it
-// already has from its own configuration, and it must, because a service that
-// nobody has announced yet still has to be invocable. So this is a trace and
-// no more, and it is worth having as one: "the peer is there" is the first
-// thing anybody asks when a request goes unanswered.
-//
-static std::map<std::string, std::string>  discoveredRequestType;   // service -> its request's type, as discovered (serviceMutex)
-
 void serviceNotification(const char* serviceName, const eprosima::ddsenabler::participants::ServiceInfo& serviceInfo)
 {
     if (serviceName == nullptr)
         return;
 
     //
-    // The one thing kept: the request's type name as the domain announces it -
-    // what Orion-LD shows as the request's ddsDataType.
+    // Kept as the domain announces it: the request's type name is what Orion-LD
+    // shows as the request's ddsDataType, and all of it is the inventory's.
     //
     bool unconfigured;
 
     {
         std::lock_guard<std::mutex> guard(serviceMutex);
-        discoveredRequestType[serviceName] = serviceInfo.request.type_name;
+        announcedService[serviceName] = serviceInfo;
         discoveredEndpoints.insert(serviceName);
 
         unconfigured = (serviceConfig.find(serviceName) == serviceConfig.end());
         if (unconfigured == true)
             discoveredService[serviceName] = { serviceInfo.request.type_name, serviceInfo.reply.type_name };
     }
+
+    discoverySeen();
 
     COR_T(0, "dds: service '%s' discovered (request '%s', reply '%s')",
           serviceName, serviceInfo.request.type_name.c_str(), serviceInfo.reply.type_name.c_str());
@@ -898,11 +942,11 @@ static void sentRemember(uint64_t requestId, const char* endpoint, const char* j
 
     {
         std::lock_guard<std::mutex> guard(serviceMutex);
-        auto dIt = discoveredRequestType.find(endpoint);
+        auto dIt = announcedService.find(endpoint);
         auto cIt = serviceConfig.find(endpoint);
 
-        if ((dIt != discoveredRequestType.end()) && (dIt->second.empty() == false))
-            sent.requestType = dIt->second;
+        if ((dIt != announcedService.end()) && (dIt->second.request.type_name.empty() == false))
+            sent.requestType = dIt->second.request.type_name;
         else if (cIt != serviceConfig.end())
             sent.requestType = cIt->second.request;
     }
@@ -1783,6 +1827,13 @@ void actionNotification(const char* actionName, const eprosima::ddsenabler::part
 
     COR_T(0, "dds: action '%s' discovered (goal '%s')", actionName, actionInfo.goal.request.type_name.c_str());
 
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+        announcedAction[actionName] = actionInfo;
+    }
+
+    discoverySeen();
+
     //
     // The action's own type is its goal request's minus the suffix every
     // action's has - the inverse of what actionQuery derives from it.
@@ -2018,6 +2069,7 @@ int init(const char* configFile, const BridgeBroker* brokerP)
     // Before the Enabler exists: its first callback needs somewhere to queue.
     //
     upcallsStart();
+    discoverySeen();                                   // discovery starts now - see inventorySettle
 
     if (eprosima::ddsenabler::create_dds_enabler(configFile, callbacks, enabler) == false)
     {
@@ -2482,6 +2534,243 @@ static const BridgeServer ddsServer =
     serviceUnserve,
     serviceReply
 };
+
+
+
+// -----------------------------------------------------------------------------
+//
+// DISCOVERY_QUIET - how long the DDS system must have said nothing for discovery to count as done
+//
+// DDS has no "discovery is over": participants announce themselves as they
+// come, and a type follows its topic only once it has been looked up. So done
+// means quiet - no topic, type, service or action for this long.
+//
+static const std::chrono::seconds  DISCOVERY_QUIET(3);
+
+
+
+// -----------------------------------------------------------------------------
+//
+// inventorySettle - wait until discovery has been quiet for DISCOVERY_QUIET, at most timeoutMs
+//
+// @return true when it went quiet, false when timeoutMs ran out first
+//
+static bool inventorySettle(int timeoutMs)
+{
+    using std::chrono::steady_clock;
+
+    steady_clock::time_point deadline = steady_clock::now() + std::chrono::milliseconds((timeoutMs > 0) ? timeoutMs : 0);
+
+    while (true)
+    {
+        steady_clock::time_point last    = steady_clock::time_point(std::chrono::nanoseconds(discoveryLastNs.load()));
+        steady_clock::time_point quietAt = last + DISCOVERY_QUIET;
+        steady_clock::time_point now     = steady_clock::now();
+
+        if (now >= quietAt)
+            return true;
+
+        if (now >= deadline)
+            return false;
+
+        std::this_thread::sleep_for(std::min(quietAt, deadline) - now);
+    }
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// endpointNode - { "type", "qos" } of one DDS topic, named 'name' (nullptr: an array item)
+//
+static CorNode* endpointNode(CorAlloc* kaP, const char* name, const eprosima::ddsenabler::participants::TopicInfo& info)
+{
+    CorNode* nodeP = corTreeObject(kaP, name);
+
+    corTreeChildAdd(nodeP, corTreeString(kaP, "type", info.type_name.c_str()));
+    corTreeChildAdd(nodeP, corTreeString(kaP, "qos",  info.serialized_qos.c_str()));
+
+    return nodeP;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// serviceNode - { "request", "reply" } of one service, named 'name'
+//
+static CorNode* serviceNode(CorAlloc* kaP, const char* name, const eprosima::ddsenabler::participants::ServiceInfo& info)
+{
+    CorNode* nodeP = corTreeObject(kaP, name);
+
+    corTreeChildAdd(nodeP, endpointNode(kaP, "request", info.request));
+    corTreeChildAdd(nodeP, endpointNode(kaP, "reply",   info.reply));
+
+    return nodeP;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// inventory - what the DDS system has announced, as JSON (ABI 14)
+//
+// The shape the DDS discovery tools write - "discoveredAt", "topics",
+// "services", "actions" - and two members more:
+//
+//   "settled"  true when discovery had gone quiet (DISCOVERY_QUIET) before the
+//              answer, false when timeoutMs ran out first and more may follow
+//   "types"    per type name, its IDL text ("idl") and a JSON sample with
+//              every member at its zero value ("sample") - what a mapping tool
+//              shows of a topic's value. A type is there once the Enabler
+//              has handed it over (typeNotification) - the types of topics,
+//              services and actions alike.
+//
+// Waits, up to timeoutMs, for discovery to go quiet, so ONE call made right
+// after the broker starts answers with what the network had to say. A broker
+// that has been up for a while answers at once.
+//
+// The DDS system is flat - there is no 'from' to start at and no depth.
+//
+int inventory(const char* from, int depth, int timeoutMs, char** jsonP, char* errBuf, int errBufLen)
+{
+    (void) depth;
+
+    if (from != nullptr)
+    {
+        snprintf(errBuf, errBufLen, "the DDS inventory is flat - there is no '%s' to start from", from);
+        return BRIDGE_NOT_FOUND;
+    }
+
+    if (enabler == nullptr)
+    {
+        snprintf(errBuf, errBufLen, "the DDS Enabler is not running");
+        return BRIDGE_ERR;
+    }
+
+    bool settled = inventorySettle(timeoutMs);
+
+    //
+    // Copied under the locks and turned into JSON outside them - the Enabler's
+    // callbacks take the same locks, inside the Enabler's own.
+    //
+    std::map<std::string, eprosima::ddsenabler::participants::TopicInfo>    topics;
+    std::map<std::string, TypeText>                                         types;
+    std::map<std::string, eprosima::ddsenabler::participants::ServiceInfo>  services;
+    std::map<std::string, eprosima::ddsenabler::participants::ActionInfo>   actions;
+
+    {
+        std::lock_guard<std::mutex> guard(discoveryMutex);
+        topics = topicStore;
+        types  = typeText;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(serviceMutex);
+        services = announcedService;
+        actions  = announcedAction;
+    }
+
+    char      kallocBuffer[8192];
+    CorAlloc  kalloc;
+    CorJson   corJson;
+
+    corAllocBufferInit(&kalloc, kallocBuffer, sizeof(kallocBuffer), 64 * 1024, nullptr, "ddsInventory");
+
+    CorJson* corJsonP = corJsonCreate(&corJson, &kalloc);
+    CorNode* treeP    = corTreeObject(&kalloc, nullptr);
+    char     now[64];
+
+    corTimeIso(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count(), 0, true, now);
+    corTreeChildAdd(treeP, corTreeString(&kalloc, "discoveredAt", now));
+    corTreeChildAdd(treeP, corTreeBoolean(&kalloc, "settled", settled));
+
+    CorNode* topicsP = corTreeArray(&kalloc, "topics");
+
+    for (const auto& topic : topics)
+    {
+        CorNode* itemP = endpointNode(&kalloc, nullptr, topic.second);
+
+        corTreeChildPrepend(itemP, corTreeString(&kalloc, "name", topic.first.c_str()));
+        corTreeChildAdd(topicsP, itemP);
+    }
+    corTreeChildAdd(treeP, topicsP);
+
+    CorNode* servicesP = corTreeArray(&kalloc, "services");
+
+    for (const auto& service : services)
+    {
+        CorNode* itemP = serviceNode(&kalloc, nullptr, service.second);
+
+        corTreeChildPrepend(itemP, corTreeString(&kalloc, "name", service.first.c_str()));
+        corTreeChildAdd(servicesP, itemP);
+    }
+    corTreeChildAdd(treeP, servicesP);
+
+    CorNode* actionsP = corTreeArray(&kalloc, "actions");
+
+    for (const auto& action : actions)
+    {
+        CorNode* itemP = corTreeObject(&kalloc, nullptr);
+
+        corTreeChildAdd(itemP, corTreeString(&kalloc, "name", action.first.c_str()));
+        corTreeChildAdd(itemP, serviceNode(&kalloc,  "goal",     action.second.goal));
+        corTreeChildAdd(itemP, serviceNode(&kalloc,  "result",   action.second.result));
+        corTreeChildAdd(itemP, serviceNode(&kalloc,  "cancel",   action.second.cancel));
+        corTreeChildAdd(itemP, endpointNode(&kalloc, "feedback", action.second.feedback));
+        corTreeChildAdd(itemP, endpointNode(&kalloc, "status",   action.second.status));
+        corTreeChildAdd(actionsP, itemP);
+    }
+    corTreeChildAdd(treeP, actionsP);
+
+    CorNode* typesP = corTreeObject(&kalloc, "types");
+
+    for (const auto& type : types)
+    {
+        CorNode* itemP = corTreeObject(&kalloc, type.first.c_str());
+
+        if (type.second.idl.empty() == false)
+            corTreeChildAdd(itemP, corTreeString(&kalloc, "idl", type.second.idl.c_str()));
+
+        //
+        // The Enabler's sample is JSON text; it goes in as JSON. Parsed in
+        // place, so from a copy - and left out if it does not parse.
+        //
+        if (type.second.sample.empty() == false)
+        {
+            char*    text    = corAllocStrdup(&kalloc, type.second.sample.c_str());
+            CorNode* sampleP = (text != nullptr) ? corJsonParse(corJsonP, text) : nullptr;
+
+            if (sampleP != nullptr)
+            {
+                sampleP->name = (char*) "sample";
+                corTreeChildAdd(itemP, sampleP);
+            }
+            else
+                COR_W("dds: the sample of type '%s' is not JSON - left out of the inventory", type.first.c_str());
+        }
+
+        corTreeChildAdd(typesP, itemP);
+    }
+    corTreeChildAdd(treeP, typesP);
+
+    int   size = corJsonFastRenderSize(treeP) + 1;
+    char* json = (char*) malloc(size);
+
+    if (json == nullptr)
+    {
+        corAllocBufferReset(&kalloc, true);
+        snprintf(errBuf, errBufLen, "out of memory (%d bytes of inventory)", size);
+        return BRIDGE_ERR;
+    }
+
+    corJsonFastRender(treeP, json);
+    corAllocBufferReset(&kalloc, true);
+
+    *jsonP = json;
+
+    return BRIDGE_OK;
+}
 
 
 

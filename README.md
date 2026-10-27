@@ -39,7 +39,7 @@ which attribute is a Channel, and Channels live in the broker.
 One file, shared with the broker, because the Enabler reads
 `dds.ddsmodule` and the broker reads `dds.ngsild`:
 
-```json
+```jsonc
 {
   "dds": {
     "ddsmodule": { "dds": { "domain": 0 } },
@@ -97,8 +97,60 @@ Topics, services and actions:
 - services and actions the DDS network announces are reported to the broker as discovered
   endpoints (`endpointDiscoveredIn`).
 
+- **inventory** (ABI 14) — what the DDS network has announced, for a mapping tool:
+  `GET /admin/bridges/dds/inventory` on the broker. See [Inventory](#inventory).
+
 Each slot is filled only when the broker's bridge ABI has it (`ddsRegister.cpp`). What the broker
 makes of them: coraine's [DDS in coraine](https://github.com/SEAMWARE/coraine/blob/main/doc/dds.md).
+
+## Inventory
+
+`GET /admin/bridges/dds/inventory` answers with every topic, service and action the DDS network has
+announced to the broker, configured or not, in the shape the DDS discovery tools write, plus
+`settled` and `types`:
+
+```jsonc
+{
+  "discoveredAt": "2026-10-27T08:37:25Z",
+  "settled": true,
+  "topics": [
+    { "name": "rt/chatter", "type": "std_msgs::msg::dds_::String_", "qos": "reliability: true\ndurability: false\nownership: false\nkeyed: false" }
+  ],
+  "services": [
+    { "name": "add_two_ints",
+      "request": { "type": "example_interfaces::srv::dds_::AddTwoInts_Request_", "qos": "..." },
+      "reply":   { "type": "example_interfaces::srv::dds_::AddTwoInts_Response_", "qos": "..." } }
+  ],
+  "actions": [
+    { "name": "fibonacci",
+      "goal":     { "request": { "type": "...", "qos": "..." }, "reply": { "type": "...", "qos": "..." } },
+      "result":   { "request": { ... }, "reply": { ... } },
+      "cancel":   { "request": { ... }, "reply": { ... } },
+      "feedback": { "type": "...", "qos": "..." },
+      "status":   { "type": "...", "qos": "..." } }
+  ],
+  "types": {
+    "std_msgs::msg::dds_::String_": {
+      "idl": "module std_msgs\n{\n    module msg\n ...",
+      "sample": { "data": "" }
+    }
+  }
+}
+```
+
+| Member | |
+|---|---|
+| `discoveredAt` | when the answer was made, UTC |
+| `settled` | `true`: discovery had been quiet for 3 s before the answer. `false`: the call's time ran out first (10 s, the broker's), and more may still be announced |
+| `topics`, `services`, `actions` | as announced; `qos` is the Enabler's serialized QoS, as it is. ROS 2 housekeeping is included: `ros_discovery_info`, `rt/parameter_events`, `rt/rosout` and every node's parameter services (`<node>/get_parameters`, ...) |
+| `types` | per type name, its IDL text (`idl`) and a JSON sample of it with every member at its zero value (`sample`), as the Enabler hands them over. Kept in memory only - `typesDirectory` holds the Enabler's binary form, not these |
+
+DDS has no "discovery is done", so the call waits for it to go quiet: no topic, type, service or
+action announced for 3 s, measured from the broker's start too. One call made right after the
+broker starts answers with what the network had to say - 3.4 s for three ROS 2 nodes; a broker that
+has been up longer answers at once. A node that starts after the answer is in the next one.
+
+The list is flat: `from` is answered 404 and `depth` is not used.
 
 ---
 

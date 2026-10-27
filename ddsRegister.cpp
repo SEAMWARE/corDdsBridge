@@ -70,5 +70,11 @@ extern "C" void bridgeRegister(BridgeDriver* driverP)
         driverP->actionGoalCancel = coraine::dds::actionGoalCancel;
     }
 
+    //
+    // ABI 14: what the DDS system has announced, for a mapping tool.
+    //
+    if (hostAbi >= 14)
+        driverP->inventory = coraine::dds::inventory;
+
     driverP->abiVersion = BRIDGE_ABI_VERSION;
 }
