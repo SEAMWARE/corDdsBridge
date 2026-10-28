@@ -21,7 +21,8 @@ the mangled symbol gets you the name and never the argument ABI, and
 So this is a C++ translation unit that includes the C contract inside
 `extern "C"`. Because a plugin is already a separate shared object, the broker
 stays `PROJECT(coraine C)` and never sees a C++ token — it `dlopen`s a black
-box exporting exactly one symbol, `bridgeRegister`.
+box exporting two symbols: `bridgeRegister`, and `corNodeLayout` - weak, from
+`corTree/CorNode.h` (included by `BridgeDriver.h`), checked by the broker when it opens the plugin.
 
 `libstdc++` does enter the broker process at `dlopen` time. That is
 unavoidable, contained, and real.
